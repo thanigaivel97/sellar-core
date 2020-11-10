@@ -4,31 +4,42 @@
 
 #include "historywork/MakeRemoteDirWork.h"
 #include "history/HistoryArchive.h"
+#include "main/Application.h"
 
 namespace stellar
 {
 
-MakeRemoteDirWork::MakeRemoteDirWork(
-    Application& app, WorkParent& parent, std::string const& dir,
-    std::shared_ptr<HistoryArchive const> archive)
-    : RunCommandWork(app, parent, std::string("make-remote-dir ") + dir)
+MakeRemoteDirWork::MakeRemoteDirWork(Application& app, std::string const& dir,
+                                     std::shared_ptr<HistoryArchive> archive)
+    : RunCommandWork(app, std::string("make-remote-dir ") + dir,
+                     BasicWork::RETRY_A_LOT)
     , mDir(dir)
     , mArchive(archive)
 {
     assert(mArchive);
 }
 
-MakeRemoteDirWork::~MakeRemoteDirWork()
+CommandInfo
+MakeRemoteDirWork::getCommand()
 {
-    clearChildren();
-}
-
-void
-MakeRemoteDirWork::getCommand(std::string& cmdLine, std::string& outFile)
-{
+    std::string cmdLine;
     if (mArchive->hasMkdirCmd())
     {
         cmdLine = mArchive->mkdirCmd(mDir);
     }
+    return CommandInfo{cmdLine, std::string()};
+}
+
+void
+MakeRemoteDirWork::onSuccess()
+{
+    mArchive->markSuccess();
+}
+
+void
+MakeRemoteDirWork::onFailureRaise()
+{
+    mArchive->markFailure();
+    RunCommandWork::onFailureRaise();
 }
 }

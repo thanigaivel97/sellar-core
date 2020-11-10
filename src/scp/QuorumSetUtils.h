@@ -4,11 +4,16 @@
 
 #pragma once
 
+#include "xdr/Stellar-SCP.h"
+
 namespace stellar
 {
+// level = 0 when there is no nesting.
+extern uint32 const MAXIMUM_QUORUM_NESTING_LEVEL;
 
-struct SCPQuorumSet;
+bool isQuorumSetSane(SCPQuorumSet const& qSet, bool extraChecks,
+                     char const*& errString);
 
-bool isQuorumSetSane(SCPQuorumSet const& qSet, bool extraChecks);
-void normalizeQSet(SCPQuorumSet& qSet);
+// normalize the quorum set, optionally removing idToRemove
+void normalizeQSet(SCPQuorumSet& qSet, NodeID const* idToRemove = nullptr);
 }

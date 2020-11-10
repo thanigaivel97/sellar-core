@@ -9,11 +9,12 @@
 #include "main/Application.h"
 #include "main/Config.h"
 #include "medida/medida.h"
-#include "overlay/LoopbackPeer.h"
 #include "overlay/StellarXDR.h"
+#include "overlay/test/LoopbackPeer.h"
 #include "simulation/LoadGenerator.h"
 #include "test/TxTests.h"
 #include "util/Timer.h"
+#include "util/XDROperators.h"
 #include "xdr/Stellar-types.h"
 
 #define SIMULATION_CREATE_NODE(N) \
@@ -23,10 +24,7 @@
 
 namespace stellar
 {
-using xdr::operator<;
-using xdr::operator==;
-
-class Simulation : public LoadGenerator
+class Simulation
 {
   public:
     enum Mode
@@ -35,14 +33,17 @@ class Simulation : public LoadGenerator
         OVER_LOOPBACK
     };
 
-    typedef std::shared_ptr<Simulation> pointer;
+    using pointer = std::shared_ptr<Simulation>;
+    using ConfigGen = std::function<Config(int i)>;
+    using QuorumSetAdjuster = std::function<SCPQuorumSet(SCPQuorumSet const&)>;
 
-    Simulation(Mode mode, Hash const& networkID,
-               std::function<Config()> confGen = nullptr);
+    Simulation(Mode mode, Hash const& networkID, ConfigGen = nullptr,
+               QuorumSetAdjuster = nullptr);
     ~Simulation();
 
     // updates all clocks in the simulation to the same time_point
-    void setCurrentTime(VirtualClock::time_point t);
+    void setCurrentVirtualTime(VirtualClock::time_point t);
+    void setCurrentVirtualTime(VirtualClock::system_time_point t);
 
     Application::pointer addNode(SecretKey nodeKey, SCPQuorumSet qSet,
                                  Config const* cfg = nullptr,
@@ -52,6 +53,9 @@ class Simulation : public LoadGenerator
     std::vector<NodeID> getNodeIDs();
 
     void addPendingConnection(NodeID const& initiator, NodeID const& acceptor);
+    // Returns LoopbackPeerConnection given initiator, acceptor pair or nullptr
+    std::shared_ptr<LoopbackPeerConnection>
+    getLoopbackConnection(NodeID const& initiator, NodeID const& acceptor);
     void startAllNodes();
     void stopAllNodes();
     void removeNode(NodeID const& id);
@@ -64,22 +68,10 @@ class Simulation : public LoadGenerator
     size_t crankAllNodes(int nbTicks = 1);
     void crankForAtMost(VirtualClock::duration seconds, bool finalCrank);
     void crankForAtLeast(VirtualClock::duration seconds, bool finalCrank);
-    void crankUntilSync(VirtualClock::duration timeout, bool finalCrank);
     void crankUntil(std::function<bool()> const& fn,
                     VirtualClock::duration timeout, bool finalCrank);
     void crankUntil(VirtualClock::time_point timePoint, bool finalCrank);
-
-    //////////
-
-    void execute(TxInfo transaction);
-    void executeAll(std::vector<TxInfo> const& transaction);
-    std::chrono::seconds
-    executeStressTest(size_t nTransactions, int injectionRatePerSec,
-                      std::function<TxInfo(size_t)> generatorFn);
-
-    std::vector<AccountInfoPtr>
-    accountsOutOfSyncWithDb(); // returns the accounts that don't match
-    bool loadAccount(AccountInfo& account);
+    void crankUntil(VirtualClock::system_time_point timePoint, bool finalCrank);
     std::string metricsSummary(std::string domain = "");
 
     void addConnection(NodeID initiator, NodeID acceptor);
@@ -113,7 +105,9 @@ class Simulation : public LoadGenerator
     std::vector<std::pair<NodeID, NodeID>> mPendingConnections;
     std::vector<std::shared_ptr<LoopbackPeerConnection>> mLoopbackConnections;
 
-    std::function<Config()> mConfigGen; // config generator
+    ConfigGen mConfigGen; // config generator
+
+    QuorumSetAdjuster mQuorumSetAdjuster;
 
     std::chrono::milliseconds const quantum = std::chrono::milliseconds(100);
 };

@@ -21,10 +21,12 @@
  */
 
 #include "overlay/Peer.h"
+#include "util/LogSlowExecution.h"
 #include "util/Timer.h"
 #include "xdr/Stellar-types.h"
 
 #include <functional>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -42,13 +44,15 @@ class Tracker
     Application& mApp;
     Peer::pointer mLastAskedPeer;
     int mNumListRebuild;
-    std::deque<Peer::pointer> mPeersToAsk;
+    // keep track of which peer we asked, and if we thought if it had the data
+    // or not at the time
+    std::map<Peer::pointer, bool> mPeersAsked;
     VirtualTimer mTimer;
     std::vector<std::pair<Hash, SCPEnvelope>> mWaitingEnvelopes;
     Hash mItemHash;
-    medida::Meter& mTryNextPeerReset;
     medida::Meter& mTryNextPeer;
     uint64 mLastSeenSlotIndex{0};
+    LogSlowExecution mFetchTime;
 
   public:
     /**
@@ -89,6 +93,11 @@ class Tracker
      * Pop envelope from stack.
      */
     SCPEnvelope pop();
+
+    /**
+     * Get duration since fetch start
+     */
+    std::chrono::milliseconds getDuration();
 
     /**
      * Called periodically to remove old envelopes from list (with ledger id
@@ -143,5 +152,13 @@ class Tracker
     {
         mLastSeenSlotIndex = 0;
     }
+
+#ifdef BUILD_TESTS
+    Peer::pointer
+    getLastAskedPeer()
+    {
+        return mLastAskedPeer;
+    }
+#endif
 };
 }

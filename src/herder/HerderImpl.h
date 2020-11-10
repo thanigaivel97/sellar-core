@@ -4,11 +4,13 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "PendingEnvelopes.h"
 #include "herder/Herder.h"
 #include "herder/HerderSCPDriver.h"
+#include "herder/PendingEnvelopes.h"
+#include "herder/TransactionQueue.h"
 #include "herder/Upgrades.h"
 #include "util/Timer.h"
+#include "util/XDROperators.h"
 #include <deque>
 #include <memory>
 #include <unordered_map>
@@ -27,9 +29,6 @@ class Application;
 class LedgerManager;
 class HerderSCPDriver;
 
-using xdr::operator<;
-using xdr::operator==;
-
 /*
  * Is in charge of receiving transactions from the network.
  */
@@ -46,6 +45,7 @@ class HerderImpl : public Herder
 
     // Bootstraps the HerderImpl if we're creating a new Network
     void bootstrap() override;
+    void shutdown() override;
 
     void restoreState() override;
 
@@ -56,72 +56,98 @@ class HerderImpl : public Herder
         return mHerderSCPDriver;
     }
 
+    void processExternalized(uint64 slotIndex, StellarValue const& value);
     void valueExternalized(uint64 slotIndex, StellarValue const& value);
     void emitEnvelope(SCPEnvelope const& envelope);
 
-    TransactionSubmitStatus recvTransaction(TransactionFramePtr tx) override;
+    TransactionQueue::AddResult
+    recvTransaction(TransactionFrameBasePtr tx) override;
 
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope) override;
     EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
                                    const SCPQuorumSet& qset,
                                    TxSetFrame txset) override;
 
-    void sendSCPStateToPeer(uint32 ledgerSeq, PeerPtr peer) override;
+    void sendSCPStateToPeer(uint32 ledgerSeq, Peer::pointer peer) override;
 
     bool recvSCPQuorumSet(Hash const& hash, const SCPQuorumSet& qset) override;
     bool recvTxSet(Hash const& hash, const TxSetFrame& txset) override;
     void peerDoesntHave(MessageType type, uint256 const& itemID,
-                        PeerPtr peer) override;
+                        Peer::pointer peer) override;
     TxSetFramePtr getTxSet(Hash const& hash) override;
     SCPQuorumSetPtr getQSet(Hash const& qSetHash) override;
 
     void processSCPQueue();
 
     uint32_t getCurrentLedgerSeq() const override;
+    uint32 getMinLedgerSeqToAskPeers() const override;
 
     SequenceNumber getMaxSeqInPendingTxs(AccountID const&) override;
 
-    void triggerNextLedger(uint32_t ledgerSeqToTrigger) override;
+    void triggerNextLedger(uint32_t ledgerSeqToTrigger,
+                           bool checkTrackingSCP) override;
+
+    void setInSyncAndTriggerNextLedger() override;
 
     void setUpgrades(Upgrades::UpgradeParameters const& upgrades) override;
     std::string getUpgradesJson() override;
 
+    void forceSCPStateIntoSyncWithLastClosedLedger() override;
+
     bool resolveNodeID(std::string const& s, PublicKey& retKey) override;
 
-    void dumpInfo(Json::Value& ret, size_t limit) override;
-    void dumpQuorumInfo(Json::Value& ret, NodeID const& id, bool summary,
-                        uint64 index) override;
+    Json::Value getJsonInfo(size_t limit, bool fullKeys = false) override;
+    Json::Value getJsonQuorumInfo(NodeID const& id, bool summary, bool fullKeys,
+                                  uint64 index) override;
+    Json::Value getJsonTransitiveQuorumIntersectionInfo(bool fullKeys) const;
+    virtual Json::Value getJsonTransitiveQuorumInfo(NodeID const& id,
+                                                    bool summary,
+                                                    bool fullKeys) override;
+    QuorumTracker::QuorumMap const& getCurrentlyTrackedQuorum() const override;
 
-    struct TxMap
-    {
-        SequenceNumber mMaxSeq{0};
-        int64_t mTotalFees{0};
-        std::unordered_map<Hash, TransactionFramePtr> mTransactions;
-        void addTx(TransactionFramePtr);
-        void recalculate();
-    };
-    typedef std::unordered_map<AccountID, std::shared_ptr<TxMap>> AccountTxMap;
+#ifdef BUILD_TESTS
+    // used for testing
+    PendingEnvelopes& getPendingEnvelopes();
+
+    TransactionQueue& getTransactionQueue();
+#endif
+
+    // helper function to verify envelopes are signed
+    bool verifyEnvelope(SCPEnvelope const& envelope);
+    // helper function to sign envelopes
+    void signEnvelope(SecretKey const& s, SCPEnvelope& envelope);
+
+    // helper function to verify SCPValues are signed
+    bool verifyStellarValueSignature(StellarValue const& sv);
+    // helper function to sign SCPValues
+    void signStellarValue(SecretKey const& s, StellarValue& sv);
 
   private:
-    void ledgerClosed();
-    void removeReceivedTxs(std::vector<TransactionFramePtr> const& txs);
+    // return true if values referenced by envelope have a valid close time:
+    // * it's within the allowed range (using lcl if possible)
+    // * it's recent enough (if `enforceRecent` is set)
+    bool checkCloseTime(SCPEnvelope const& envelope, bool enforceRecent);
 
-    void startRebroadcastTimer();
-    void rebroadcast();
+    // Given a candidate close time, determine an offset needed to make it
+    // valid (at current system time). Returns 0 if ct is already valid
+    std::chrono::milliseconds
+    ctValidityOffset(uint64_t ct, std::chrono::milliseconds maxCtOffset =
+                                      std::chrono::milliseconds::zero());
+
+    void ledgerClosed(bool synchronous);
+
+    void maybeTriggerNextLedger(bool synchronous);
+
+    void startOutOfSyncTimer();
+    void outOfSyncRecovery();
     void broadcast(SCPEnvelope const& e);
-
-    void updateSCPCounters();
 
     void processSCPQueueUpToIndex(uint64 slotIndex);
 
-    // 0- tx we got during ledger close
-    // 1- one ledger ago. rebroadcast
-    // 2- two ledgers ago. rebroadcast
-    // ...
-    std::deque<AccountTxMap> mPendingTransactions;
+    TransactionQueue mTransactionQueue;
 
     void
-    updatePendingTransactions(std::vector<TransactionFramePtr> const& applied);
+    updateTransactionQueue(std::vector<TransactionFrameBasePtr> const& applied);
 
     PendingEnvelopes mPendingEnvelopes;
     Upgrades mUpgrades;
@@ -129,12 +155,18 @@ class HerderImpl : public Herder
 
     void herderOutOfSync();
 
+    // attempt to retrieve additional SCP messages from peers
+    void getMoreSCPState();
+
     // last slot that was persisted into the database
-    // only keep track of the most recent slot
+    // keep track of all messages for MAX_SLOTS_TO_REMEMBER slots
     uint64 mLastSlotSaved;
 
     // timer that detects that we're stuck on an SCP slot
     VirtualTimer mTrackingTimer;
+
+    // tracks the last time externalize was called
+    VirtualClock::time_point mLastExternalize;
 
     // saves the SCP messages that the instance sent out last
     void persistSCPState(uint64 slot);
@@ -150,10 +182,9 @@ class HerderImpl : public Herder
     // indeterminate mode
     void trackingHeartBeat();
 
-    VirtualClock::time_point mLastTrigger;
     VirtualTimer mTriggerTimer;
 
-    VirtualTimer mRebroadcastTimer;
+    VirtualTimer mOutOfSyncTimer;
 
     Application& mApp;
     LedgerManager& mLedgerManager;
@@ -162,29 +193,56 @@ class HerderImpl : public Herder
     {
         medida::Meter& mLostSync;
 
-        medida::Meter& mBallotExpire;
-
         medida::Meter& mEnvelopeEmit;
         medida::Meter& mEnvelopeReceive;
-
-        // Counters for stuff in parent class (SCP)
-        // that we monitor on a best-effort basis from
-        // here.
-        medida::Counter& mKnownSlotsSize;
 
         // Counters for things reached-through the
         // SCP maps: Slots and Nodes
         medida::Counter& mCumulativeStatements;
 
-        // Pending tx buffer sizes
-        medida::Counter& mHerderPendingTxs0;
-        medida::Counter& mHerderPendingTxs1;
-        medida::Counter& mHerderPendingTxs2;
-        medida::Counter& mHerderPendingTxs3;
+        // envelope signature verification
+        medida::Meter& mEnvelopeValidSig;
+        medida::Meter& mEnvelopeInvalidSig;
 
         SCPMetrics(Application& app);
     };
 
     SCPMetrics mSCPMetrics;
+
+    // Check that the quorum map intersection state is up to date, and if not
+    // run a background job that re-analyzes the current quorum map.
+    void checkAndMaybeReanalyzeQuorumMap();
+
+    // erase all data for ledgers strictly less than ledgerSeq
+    void eraseBelow(uint32 ledgerSeq);
+
+    struct QuorumMapIntersectionState
+    {
+        uint32_t mLastCheckLedger{0};
+        uint32_t mLastGoodLedger{0};
+        size_t mNumNodes{0};
+        Hash mLastCheckQuorumMapHash{};
+        Hash mCheckingQuorumMapHash{};
+        bool mRecalculating{false};
+        std::atomic<bool> mInterruptFlag{false};
+        std::pair<std::vector<PublicKey>, std::vector<PublicKey>>
+            mPotentialSplit{};
+        std::set<std::set<PublicKey>> mIntersectionCriticalNodes{};
+
+        bool
+        hasAnyResults() const
+        {
+            return mLastGoodLedger != 0;
+        }
+
+        bool
+        enjoysQuorunIntersection() const
+        {
+            return mLastCheckLedger == mLastGoodLedger;
+        }
+    };
+    QuorumMapIntersectionState mLastQuorumMapIntersectionState;
+
+    uint32_t getMinLedgerSeqToRemember() const;
 };
 }

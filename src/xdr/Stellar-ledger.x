@@ -10,12 +10,24 @@ namespace stellar
 
 typedef opaque UpgradeType<128>;
 
+enum StellarValueType
+{
+    STELLAR_VALUE_BASIC = 0,
+    STELLAR_VALUE_SIGNED = 1
+};
+
+struct LedgerCloseValueSignature
+{
+    NodeID nodeID;       // which node introduced the value
+    Signature signature; // nodeID's signature
+};
+
 /* StellarValue is the value used by SCP to reach consensus on a given ledger
-*/
+ */
 struct StellarValue
 {
-    Hash txSetHash;   // transaction set to apply to previous ledger
-    uint64 closeTime; // network close time
+    Hash txSetHash;      // transaction set to apply to previous ledger
+    TimePoint closeTime; // network close time
 
     // upgrades to apply to the previous ledger (usually empty)
     // this is a vector of encoded 'LedgerUpgrade' so that nodes can drop
@@ -25,17 +37,19 @@ struct StellarValue
     UpgradeType upgrades<6>;
 
     // reserved for future use
-    union switch (int v)
+    union switch (StellarValueType v)
     {
-    case 0:
+    case STELLAR_VALUE_BASIC:
         void;
+    case STELLAR_VALUE_SIGNED:
+        LedgerCloseValueSignature lcValueSignature;
     }
     ext;
 };
 
 /* The LedgerHeader is the highest level structure representing the
  * state of a ledger, cryptographically linked to previous ledgers.
-*/
+ */
 struct LedgerHeader
 {
     uint32 ledgerVersion;    // the protocol version of the ledger
@@ -55,7 +69,6 @@ struct LedgerHeader
     uint64 idPool; // last used global ID, used for generating objects
 
     uint32 baseFee;     // base fee per operation in stroops
-    uint32 basePercentageFee;     // base percentage fee per create account and payment operation, in basis points
     uint32 baseReserve; // account base reserve in stroops
 
     uint32 maxTxSetSize; // maximum size a transaction set can be
@@ -85,8 +98,7 @@ enum LedgerUpgradeType
     LEDGER_UPGRADE_VERSION = 1,
     LEDGER_UPGRADE_BASE_FEE = 2,
     LEDGER_UPGRADE_MAX_TX_SET_SIZE = 3,
-    LEDGER_UPGRADE_BASE_RESERVE = 4,
-    LEDGER_UPGRADE_BASE_PERCENTAGE_FEE = 5,
+    LEDGER_UPGRADE_BASE_RESERVE = 4
 };
 
 union LedgerUpgrade switch (LedgerUpgradeType type)
@@ -99,55 +111,43 @@ case LEDGER_UPGRADE_MAX_TX_SET_SIZE:
     uint32 newMaxTxSetSize; // update maxTxSetSize
 case LEDGER_UPGRADE_BASE_RESERVE:
     uint32 newBaseReserve; // update baseReserve
-case LEDGER_UPGRADE_BASE_PERCENTAGE_FEE:
-    uint32 newBasePercentageFee; // update basePercentageFee
 };
 
 /* Entries used to define the bucket list */
-
-union LedgerKey switch (LedgerEntryType type)
-{
-case ACCOUNT:
-    struct
-    {
-        AccountID accountID;
-    } account;
-
-case TRUSTLINE:
-    struct
-    {
-        AccountID accountID;
-        Asset asset;
-    } trustLine;
-
-case OFFER:
-    struct
-    {
-        AccountID sellerID;
-        uint64 offerID;
-    } offer;
-
-case DATA:
-    struct
-    {
-        AccountID accountID;
-        string64 dataName;
-    } data;
-};
-
 enum BucketEntryType
 {
-    LIVEENTRY = 0,
-    DEADENTRY = 1
+    METAENTRY =
+        -1, // At-and-after protocol 11: bucket metadata, should come first.
+    LIVEENTRY = 0, // Before protocol 11: created-or-updated;
+                   // At-and-after protocol 11: only updated.
+    DEADENTRY = 1,
+    INITENTRY = 2 // At-and-after protocol 11: only created.
+};
+
+struct BucketMetadata
+{
+    // Indicates the protocol version used to create / merge this bucket.
+    uint32 ledgerVersion;
+
+    // reserved for future use
+    union switch (int v)
+    {
+    case 0:
+        void;
+    }
+    ext;
 };
 
 union BucketEntry switch (BucketEntryType type)
 {
 case LIVEENTRY:
+case INITENTRY:
     LedgerEntry liveEntry;
 
 case DEADENTRY:
     LedgerKey deadEntry;
+case METAENTRY:
+    BucketMetadata metaEntry;
 };
 
 // Transaction sets are the unit used by SCP to decide on transitions
@@ -269,9 +269,72 @@ struct OperationMeta
     LedgerEntryChanges changes;
 };
 
+struct TransactionMetaV1
+{
+    LedgerEntryChanges txChanges; // tx level changes if any
+    OperationMeta operations<>;   // meta for each operation
+};
+
+struct TransactionMetaV2
+{
+    LedgerEntryChanges txChangesBefore; // tx level changes before operations
+                                        // are applied if any
+    OperationMeta operations<>;         // meta for each operation
+    LedgerEntryChanges txChangesAfter;  // tx level changes after operations are
+                                        // applied if any
+};
+
+// this is the meta produced when applying transactions
+// it does not include pre-apply updates such as fees
 union TransactionMeta switch (int v)
 {
 case 0:
     OperationMeta operations<>;
+case 1:
+    TransactionMetaV1 v1;
+case 2:
+    TransactionMetaV2 v2;
+};
+
+// This struct groups together changes on a per transaction basis
+// note however that fees and transaction application are done in separate
+// phases
+struct TransactionResultMeta
+{
+    TransactionResultPair result;
+    LedgerEntryChanges feeProcessing;
+    TransactionMeta txApplyProcessing;
+};
+
+// this represents a single upgrade that was performed as part of a ledger
+// upgrade
+struct UpgradeEntryMeta
+{
+    LedgerUpgrade upgrade;
+    LedgerEntryChanges changes;
+};
+
+struct LedgerCloseMetaV0
+{
+    LedgerHeaderHistoryEntry ledgerHeader;
+    // NB: txSet is sorted in "Hash order"
+    TransactionSet txSet;
+
+    // NB: transactions are sorted in apply order here
+    // fees for all transactions are processed first
+    // followed by applying transactions
+    TransactionResultMeta txProcessing<>;
+
+    // upgrades are applied last
+    UpgradeEntryMeta upgradesProcessing<>;
+
+    // other misc information attached to the ledger close
+    SCPHistoryEntry scpInfo<>;
+};
+
+union LedgerCloseMeta switch (int v)
+{
+case 0:
+    LedgerCloseMetaV0 v0;
 };
 }

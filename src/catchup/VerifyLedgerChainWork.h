@@ -7,6 +7,9 @@
 #include "history/HistoryManager.h"
 #include "ledger/LedgerRange.h"
 #include "work/Work.h"
+#include <future>
+#include <iosfwd>
+#include <vector>
 
 namespace medida
 {
@@ -19,34 +22,79 @@ namespace stellar
 class TmpDir;
 struct LedgerHeaderHistoryEntry;
 
-class VerifyLedgerChainWork : public Work
+// This class verifies ledger chain of a given range by checking the hashes.
+// Note that verification is done starting with the latest checkpoint in the
+// range, and working its way backwards to the beginning of the range.
+class VerifyLedgerChainWork : public BasicWork
 {
     TmpDir const& mDownloadDir;
-    LedgerRange mRange;
+    LedgerRange const mRange;
     uint32_t mCurrCheckpoint;
-    bool mManualCatchup;
-    LedgerHeaderHistoryEntry& mFirstVerified;
-    LedgerHeaderHistoryEntry& mLastVerified;
+    LedgerNumHashPair const mLastClosed;
 
-    medida::Meter& mVerifyLedgerSuccessOld;
+    // Incoming var to read trusted hash of max ledger from. We use a
+    // shared_future here because it allows reading the value multiple
+    // times and we might be reset and re-run.
+    std::shared_future<LedgerNumHashPair> const mTrustedMaxLedger;
+
+    // Outgoing var to write minimum verified ledger's PreviousLedgerHash to.
+    std::promise<LedgerNumHashPair> mVerifiedMinLedgerPrev;
+
+    // Cached read-side of mVerifiedMinLedgerPrev -- unfortunately one can
+    // only call get_future once on a promise, so we must build (and retain)
+    // a shared_future from the result of that call on construction.
+    std::shared_future<LedgerNumHashPair> mVerifiedMinLedgerPrevFuture;
+
+    // Propagation link written on each call to verifyHistoryOfSingleCheckpoint,
+    // must match max ledger in current call to verifyHistoryOfSingleCheckpoint.
+    LedgerNumHashPair mVerifiedAhead;
+
+    // Max ledger of the min checkpoint in the verified range. This is the
+    // "checkpoint ledger" of the min checkpoint during catchup, which is also
+    // where the bucket applicator will apply buckets.
+    LedgerHeaderHistoryEntry mMaxVerifiedLedgerOfMinCheckpoint{};
+
+    // Buffered ledger hashes that have been verified and optional output stream
+    // to write them to.
+    std::vector<LedgerNumHashPair> mVerifiedLedgers;
+    std::shared_ptr<std::ofstream> mOutputStream;
+
     medida::Meter& mVerifyLedgerSuccess;
-    medida::Meter& mVerifyLedgerFailureOvershot;
-    medida::Meter& mVerifyLedgerFailureLink;
     medida::Meter& mVerifyLedgerChainSuccess;
     medida::Meter& mVerifyLedgerChainFailure;
-    medida::Meter& mVerifyLedgerChainFailureEnd;
 
-    HistoryManager::VerifyHashStatus verifyHistoryOfSingleCheckpoint();
+    HistoryManager::LedgerVerificationStatus verifyHistoryOfSingleCheckpoint();
 
   public:
-    VerifyLedgerChainWork(Application& app, WorkParent& parent,
-                          TmpDir const& downloadDir, LedgerRange range,
-                          bool manualCatchup,
-                          LedgerHeaderHistoryEntry& firstVerified,
-                          LedgerHeaderHistoryEntry& lastVerified);
-    ~VerifyLedgerChainWork();
+    VerifyLedgerChainWork(
+        Application& app, TmpDir const& downloadDir, LedgerRange const& range,
+        LedgerNumHashPair const& lastClosedLedger,
+        std::shared_future<LedgerNumHashPair> trustedMaxLedger,
+        std::shared_ptr<std::ofstream> outputStream = nullptr);
+    ~VerifyLedgerChainWork() override = default;
     std::string getStatus() const override;
+
+    std::shared_future<LedgerNumHashPair>
+    getVerifiedMinLedgerPrev() const
+    {
+        return mVerifiedMinLedgerPrevFuture;
+    }
+
+    LedgerHeaderHistoryEntry
+    getMaxVerifiedLedgerOfMinCheckpoint()
+    {
+        return mMaxVerifiedLedgerOfMinCheckpoint;
+    }
+
+  protected:
     void onReset() override;
-    Work::State onSuccess() override;
+
+    BasicWork::State onRun() override;
+    void onSuccess() override;
+    bool
+    onAbort() override
+    {
+        return true;
+    };
 };
 }

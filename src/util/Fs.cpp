@@ -4,15 +4,26 @@
 
 #include "util/Fs.h"
 #include "crypto/Hex.h"
-#include "lib/util/format.h"
+#include "util/FileSystemException.h"
 #include "util/Logging.h"
+#include <Tracy.hpp>
+#include <fmt/format.h>
+
 #include <map>
 #include <regex>
 #include <sstream>
 
 #ifdef _WIN32
 #include <direct.h>
+
+// Latest version of VC++ complains without this define (confused by C++ 17)
+#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING 1
+#include <experimental/filesystem>
+
+#include <io.h>
 #else
+#include <dirent.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #endif
 
@@ -34,6 +45,7 @@ static std::map<std::string, HANDLE> lockMap;
 void
 lockFile(std::string const& path)
 {
+    ZoneScoped;
     std::ostringstream errmsg;
 
     if (lockMap.find(path) != lockMap.end())
@@ -51,7 +63,7 @@ lockFile(std::string const& path)
     {
         // not sure if there is more verbose info that can be obtained here
         errmsg << "unable to create lock file: " << path;
-        throw std::runtime_error(errmsg.str());
+        throw FileSystemException(errmsg.str());
     }
 
     lockMap.insert(std::make_pair(path, h));
@@ -60,6 +72,7 @@ lockFile(std::string const& path)
 void
 unlockFile(std::string const& path)
 {
+    ZoneScoped;
     auto it = lockMap.find(path);
     if (it != lockMap.end())
     {
@@ -72,9 +85,63 @@ unlockFile(std::string const& path)
     }
 }
 
+void
+flushFileChanges(native_handle_t fh)
+{
+    ZoneScoped;
+    if (FlushFileBuffers(fh) == FALSE)
+    {
+        FileSystemException::failWithGetLastError(
+            "fs::flushFileChanges() failed on _get_osfhandle(): ");
+    }
+}
+
+bool
+shouldUseRandomAccessHandle(std::string const& path)
+{
+    // Named pipes use stream mode, everything else uses random access.
+    return path.find("\\\\.\\pipe\\") != 0;
+}
+
+native_handle_t
+openFileToWrite(std::string const& path)
+{
+    ZoneScoped;
+    HANDLE h = ::CreateFile(
+        path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,                   // DesiredAccess
+        FILE_SHARE_READ | FILE_SHARE_WRITE,             // ShareMode
+        NULL,                                           // SecurityAttributes
+        CREATE_ALWAYS,                                  // CreationDisposition
+        (FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED), // FlagsAndAttributes
+        NULL);                                          // TemplateFile
+
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        FileSystemException::failWithGetLastError(
+            std::string("fs::openFileToWrite() failed on CreateFile(\"") +
+            path + std::string("\"): "));
+    }
+    return h;
+}
+
+bool
+durableRename(std::string const& src, std::string const& dst,
+              std::string const& dir)
+{
+    ZoneScoped;
+    if (MoveFileExA(src.c_str(), dst.c_str(), MOVEFILE_WRITE_THROUGH) == 0)
+    {
+        FileSystemException::failWithGetLastError(
+            "fs::durableRename() failed on MoveFileExA(): ");
+    }
+    return true;
+}
+
 bool
 exists(std::string const& name)
 {
+    ZoneScoped;
     if (name.empty())
         return false;
 
@@ -88,7 +155,7 @@ exists(std::string const& name)
         else
         {
             std::string msg("error accessing path: ");
-            throw std::runtime_error(msg + name);
+            throw FileSystemException(msg + name);
         }
     }
     return true;
@@ -97,6 +164,7 @@ exists(std::string const& name)
 bool
 mkdir(std::string const& name)
 {
+    ZoneScoped;
     bool b = _mkdir(name.c_str()) == 0;
     CLOG(DEBUG, "Fs") << (b ? "created dir " : "failed to create dir ") << name;
     return b;
@@ -105,47 +173,32 @@ mkdir(std::string const& name)
 void
 deltree(std::string const& d)
 {
-    SHFILEOPSTRUCT s = {0};
-    std::string from = d;
-    from.push_back('\0');
-    from.push_back('\0');
-    s.wFunc = FO_DELETE;
-    s.pFrom = from.data();
-    s.fFlags = FOF_NO_UI;
-    if (SHFileOperation(&s) != 0)
-    {
-        throw std::runtime_error("SHFileOperation failed in deltree");
-    }
+    ZoneScoped;
+    namespace fs = std::experimental::filesystem;
+    fs::remove_all(fs::path(d));
 }
 
-long
-getCurrentPid()
+std::vector<std::string>
+findfiles(std::string const& p,
+          std::function<bool(std::string const& name)> predicate)
 {
-    return static_cast<long>(GetCurrentProcessId());
-}
+    ZoneScoped;
+    using namespace std;
+    namespace fs = std::experimental::filesystem;
 
-bool
-processExists(long pid)
-{
-    std::vector<DWORD> buffer(4096);
-    DWORD bytesWritten;
-    for (;;)
+    std::vector<std::string> res;
+    for (auto& entry : fs::directory_iterator(fs::path(p)))
     {
-        if (!EnumProcesses(buffer.data(),
-                           static_cast<DWORD>(buffer.size() * sizeof(DWORD)),
-                           &bytesWritten))
+        if (fs::is_regular_file(entry.status()))
         {
-            throw std::runtime_error("EnumProcess failed");
+            auto n = entry.path().filename().string();
+            if (predicate(n))
+            {
+                res.emplace_back(n);
+            }
         }
-        if (bytesWritten / sizeof(DWORD) < buffer.size())
-        {
-            auto found = std::find(buffer.begin(), buffer.end(),
-                                   static_cast<DWORD>(pid));
-            return !(found == buffer.end());
-        }
-        // Need a larger buffer to hold all the ids.
-        buffer.resize(buffer.size() * 2);
     }
+    return res;
 }
 
 #else
@@ -162,6 +215,7 @@ static std::map<std::string, int> lockMap;
 void
 lockFile(std::string const& path)
 {
+    ZoneScoped;
     std::ostringstream errmsg;
 
     if (lockMap.find(path) != lockMap.end())
@@ -175,7 +229,7 @@ lockFile(std::string const& path)
     {
         errmsg << "unable to open lock file: " << path << " ("
                << strerror(errno) << ")";
-        throw std::runtime_error(errmsg.str());
+        throw FileSystemException(errmsg.str());
     }
 
     int r = flock(fd, LOCK_EX | LOCK_NB);
@@ -184,7 +238,7 @@ lockFile(std::string const& path)
         close(fd);
         errmsg << "unable to flock file: " << path << " (" << strerror(errno)
                << ")";
-        throw std::runtime_error(errmsg.str());
+        throw FileSystemException(errmsg.str());
     }
 
     lockMap.insert(std::make_pair(path, fd));
@@ -193,6 +247,7 @@ lockFile(std::string const& path)
 void
 unlockFile(std::string const& path)
 {
+    ZoneScoped;
     auto it = lockMap.find(path);
     if (it != lockMap.end())
     {
@@ -206,9 +261,89 @@ unlockFile(std::string const& path)
     }
 }
 
+void
+flushFileChanges(native_handle_t fd)
+{
+    ZoneScoped;
+    while (fsync(fd) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            "fs::flushFileChanges() failed on fsync(): ");
+    }
+}
+
+bool
+shouldUseRandomAccessHandle(std::string const& path)
+{
+    return false;
+}
+
+native_handle_t
+openFileToWrite(std::string const& path)
+{
+    ZoneScoped;
+    int fd;
+    while ((fd = ::open(path.c_str(), O_CREAT | O_WRONLY | O_APPEND, 0644)) ==
+           -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(std::string("fs::openFile(\"") +
+                                           path + "\") failed: ");
+    }
+    return fd;
+}
+
+bool
+durableRename(std::string const& src, std::string const& dst,
+              std::string const& dir)
+{
+    ZoneScoped;
+    if (rename(src.c_str(), dst.c_str()) != 0)
+    {
+        return false;
+    }
+    int dfd;
+    while ((dfd = open(dir.c_str(), O_RDONLY)) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            std::string("Failed to open directory ") + dir + " :");
+    }
+    while (fsync(dfd) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            std::string("Failed to fsync directory ") + dir + " :");
+    }
+    while (close(dfd) == -1)
+    {
+        if (errno == EINTR)
+        {
+            continue;
+        }
+        FileSystemException::failWithErrno(
+            std::string("Failed to close directory ") + dir + " :");
+    }
+    return true;
+}
+
 bool
 exists(std::string const& name)
 {
+    ZoneScoped;
     struct stat buf;
     if (stat(name.c_str(), &buf) == -1)
     {
@@ -219,7 +354,7 @@ exists(std::string const& name)
         else
         {
             std::string msg("error accessing path: ");
-            throw std::runtime_error(msg + name);
+            throw FileSystemException(msg + name);
         }
     }
     return true;
@@ -228,6 +363,7 @@ exists(std::string const& name)
 bool
 mkdir(std::string const& name)
 {
+    ZoneScoped;
     bool b = ::mkdir(name.c_str(), 0700) == 0;
     CLOG(DEBUG, "Fs") << (b ? "created dir " : "failed to create dir ") << name;
     return b;
@@ -240,21 +376,22 @@ int
 nftw_deltree_callback(char const* name, struct stat const* st, int flag,
                       struct FTW* ftw)
 {
+    ZoneScoped;
     CLOG(DEBUG, "Fs") << "deleting: " << name;
     if (flag == FTW_DP)
     {
         if (rmdir(name) != 0)
         {
-            throw std::runtime_error(std::string{"rmdir of "} + name +
-                                     " failed");
+            throw FileSystemException(std::string{"rmdir of "} + name +
+                                      " failed");
         }
     }
     else
     {
         if (std::remove(name) != 0)
         {
-            throw std::runtime_error(std::string{"std::remove of "} + name +
-                                     " failed");
+            throw FileSystemException(std::string{"std::remove of "} + name +
+                                      " failed");
         }
     }
     return 0;
@@ -264,22 +401,45 @@ nftw_deltree_callback(char const* name, struct stat const* st, int flag,
 void
 deltree(std::string const& d)
 {
+    ZoneScoped;
     if (nftw(d.c_str(), nftw_deltree_callback, FOPEN_MAX, FTW_DEPTH) != 0)
     {
-        throw std::runtime_error("nftw failed in deltree for " + d);
+        throw FileSystemException("nftw failed in deltree for " + d);
     }
 }
 
-long
-getCurrentPid()
+std::vector<std::string>
+findfiles(std::string const& path,
+          std::function<bool(std::string const& name)> predicate)
 {
-    return static_cast<long>(getpid());
-}
+    ZoneScoped;
+    auto dir = opendir(path.c_str());
+    auto result = std::vector<std::string>{};
+    if (!dir)
+    {
+        return result;
+    }
 
-bool
-processExists(long pid)
-{
-    return (kill(pid, 0) == 0);
+    try
+    {
+        while (auto entry = readdir(dir))
+        {
+            auto name = std::string{entry->d_name};
+            if (predicate(name))
+            {
+                result.push_back(name);
+            }
+        }
+
+        closedir(dir);
+        return result;
+    }
+    catch (...)
+    {
+        // small RAII class could do here
+        closedir(dir);
+        throw;
+    }
 }
 
 #endif
@@ -312,6 +472,7 @@ PathSplitter::hasNext() const
 bool
 mkpath(const std::string& path)
 {
+    ZoneScoped;
     auto splitter = PathSplitter{path};
     while (splitter.hasNext())
     {
@@ -334,7 +495,8 @@ hexStr(uint32_t checkpointNum)
 std::string
 hexDir(std::string const& hexStr)
 {
-    std::regex rx("([[:xdigit:]]{2})([[:xdigit:]]{2})([[:xdigit:]]{2}).*");
+    static const std::regex rx(
+        "([[:xdigit:]]{2})([[:xdigit:]]{2})([[:xdigit:]]{2}).*");
     std::smatch sm;
     bool matched = std::regex_match(hexStr, sm, rx);
     assert(matched);
@@ -365,7 +527,7 @@ remoteName(std::string const& type, std::string const& hexStr,
 void
 checkGzipSuffix(std::string const& filename)
 {
-    std::string suf(".gz");
+    static const std::string suf(".gz");
     if (!(filename.size() >= suf.size() &&
           equal(suf.rbegin(), suf.rend(), filename.rbegin())))
     {
@@ -376,12 +538,67 @@ checkGzipSuffix(std::string const& filename)
 void
 checkNoGzipSuffix(std::string const& filename)
 {
-    std::string suf(".gz");
+    static const std::string suf(".gz");
     if (filename.size() >= suf.size() &&
         equal(suf.rbegin(), suf.rend(), filename.rbegin()))
     {
         throw std::runtime_error("filename ends in .gz");
     }
 }
+
+size_t
+size(std::ifstream& ifs)
+{
+    ZoneScoped;
+    assert(ifs.is_open());
+
+    ifs.seekg(0, ifs.end);
+    auto result = ifs.tellg();
+    ifs.seekg(0, ifs.beg);
+
+    return std::max(decltype(result){0}, result);
+}
+
+size_t
+size(std::string const& filename)
+{
+    ZoneScoped;
+    std::ifstream ifs;
+    ifs.open(filename, std::ifstream::binary);
+    if (ifs)
+    {
+        ifs.exceptions(std::ios::badbit);
+        return size(ifs);
+    }
+    else
+    {
+        return 0;
+    }
+}
+
+#ifdef _WIN32
+
+int
+getMaxConnections()
+{
+    // on Windows, there is no limit on handles
+    // only limits based on ephemeral ports, etc
+    return 32000;
+}
+
+#else
+int
+getMaxConnections()
+{
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0)
+    {
+        // leave some buffer
+        return (rl.rlim_cur * 3) / 4;
+    }
+    // could not query the limit, default to a value that should work
+    return 64;
+}
+#endif
 }
 }

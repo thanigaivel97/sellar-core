@@ -9,17 +9,19 @@
 #include "invariant/Invariant.h"
 #include "invariant/InvariantDoesNotHold.h"
 #include "invariant/InvariantManagerImpl.h"
-#include "ledger/LedgerDelta.h"
-#include "lib/util/format.h"
+#include "ledger/LedgerTxn.h"
 #include "main/Application.h"
+#include "main/ErrorMessages.h"
 #include "util/Logging.h"
-#include "xdrpp/printer.h"
+#include "util/XDRCereal.h"
+#include <fmt/format.h>
 
 #include "medida/counter.h"
 #include "medida/metrics_registry.h"
 
 #include <memory>
 #include <numeric>
+#include <regex>
 
 namespace stellar
 {
@@ -27,33 +29,43 @@ namespace stellar
 std::unique_ptr<InvariantManager>
 InvariantManager::create(Application& app)
 {
-    return make_unique<InvariantManagerImpl>(app.getMetrics());
+    return std::make_unique<InvariantManagerImpl>(app.getMetrics());
 }
 
 InvariantManagerImpl::InvariantManagerImpl(medida::MetricsRegistry& registry)
-    : mMetricsRegistry(registry)
+    : mInvariantFailureCount(
+          registry.NewCounter({"ledger", "invariant", "failure"}))
 {
 }
 
 Json::Value
-InvariantManagerImpl::getInformation()
+InvariantManagerImpl::getJsonInfo()
 {
     Json::Value failures;
-    for (auto const& invariant : mInvariants)
-    {
-        auto& counter = mMetricsRegistry.NewCounter(
-            {"invariant", "does-not-hold", "count", invariant.first});
-        if (counter.count() > 0)
-        {
-            auto const& info = mFailureInformation.at(invariant.first);
 
-            auto& fail = failures[invariant.first];
-            fail["count"] = (Json::Int64)counter.count();
-            fail["last_failed_on_ledger"] = info.lastFailedOnLedger;
-            fail["last_failed_with_message"] = info.lastFailedWithMessage;
-        }
+    for (auto const& fi : mFailureInformation)
+    {
+        auto& fail = failures[fi.first];
+        auto& info = fi.second;
+        fail["last_failed_on_ledger"] = info.lastFailedOnLedger;
+        fail["last_failed_with_message"] = info.lastFailedWithMessage;
+    }
+    if (!failures.empty())
+    {
+        failures["count"] = (Json::Int64)mInvariantFailureCount.count();
     }
     return failures;
+}
+
+std::vector<std::string>
+InvariantManagerImpl::getEnabledInvariants() const
+{
+    std::vector<std::string> res;
+    for (auto const& p : mEnabled)
+    {
+        res.emplace_back(p->getName());
+    }
+    return res;
 }
 
 void
@@ -87,16 +99,17 @@ InvariantManagerImpl::checkOnBucketApply(std::shared_ptr<Bucket const> bucket,
 void
 InvariantManagerImpl::checkOnOperationApply(Operation const& operation,
                                             OperationResult const& opres,
-                                            LedgerDelta const& delta)
+                                            LedgerTxnDelta const& ltxDelta)
 {
-    if (delta.getHeader().ledgerVersion < 8)
+    if (ltxDelta.header.current.ledgerVersion < 8)
     {
         return;
     }
 
     for (auto invariant : mEnabled)
     {
-        auto result = invariant->checkOnOperationApply(operation, opres, delta);
+        auto result =
+            invariant->checkOnOperationApply(operation, opres, ltxDelta);
         if (result.empty())
         {
             continue;
@@ -104,8 +117,9 @@ InvariantManagerImpl::checkOnOperationApply(Operation const& operation,
 
         auto message = fmt::format(
             R"(Invariant "{}" does not hold on operation: {}{}{})",
-            invariant->getName(), result, "\n", xdr::xdr_to_string(operation));
-        onInvariantFailure(invariant, message, delta.getHeader().ledgerSeq);
+            invariant->getName(), result, "\n", xdr_to_string(operation));
+        onInvariantFailure(invariant, message,
+                           ltxDelta.header.current.ledgerSeq);
     }
 }
 
@@ -117,8 +131,6 @@ InvariantManagerImpl::registerInvariant(std::shared_ptr<Invariant> invariant)
     if (iter == mInvariants.end())
     {
         mInvariants[name] = invariant;
-        mMetricsRegistry.NewCounter(
-            {"invariant", "does-not-hold", "count", invariant->getName()});
     }
     else
     {
@@ -128,12 +140,48 @@ InvariantManagerImpl::registerInvariant(std::shared_ptr<Invariant> invariant)
 }
 
 void
-InvariantManagerImpl::enableInvariant(std::string const& name)
+InvariantManagerImpl::enableInvariant(std::string const& invPattern)
 {
-    auto registryIter = mInvariants.find(name);
-    if (registryIter == mInvariants.end())
+    if (invPattern.empty())
     {
-        std::string message = "Invariant " + name + " is not registered.";
+        throw std::invalid_argument("Invariant pattern must be non empty");
+    }
+
+    std::regex r;
+    try
+    {
+        r = std::regex(invPattern, std::regex::ECMAScript | std::regex::icase);
+    }
+    catch (std::regex_error& e)
+    {
+        throw std::invalid_argument(fmt::format(
+            "Invalid invariant pattern '{}': {}", invPattern, e.what()));
+    }
+
+    bool enabledSome = false;
+    for (auto const& inv : mInvariants)
+    {
+        auto const& name = inv.first;
+        if (std::regex_match(name, r, std::regex_constants::match_not_null))
+        {
+            auto iter = std::find(mEnabled.begin(), mEnabled.end(), inv.second);
+            if (iter == mEnabled.end())
+            {
+                enabledSome = true;
+                mEnabled.push_back(inv.second);
+                CLOG(INFO, "Invariant") << "Enabled invariant '" << name << "'";
+            }
+            else
+            {
+                throw std::runtime_error{"Invariant " + name +
+                                         " already enabled"};
+            }
+        }
+    }
+    if (!enabledSome)
+    {
+        std::string message = fmt::format(
+            "Invariant pattern '{}' did not match any invariants.", invPattern);
         if (mInvariants.size() > 0)
         {
             using value_type = decltype(mInvariants)::value_type;
@@ -151,18 +199,6 @@ InvariantManagerImpl::enableInvariant(std::string const& name)
         }
         throw std::runtime_error{message};
     }
-
-    auto iter =
-        std::find(mEnabled.begin(), mEnabled.end(), registryIter->second);
-    if (iter == mEnabled.end())
-    {
-        mEnabled.push_back(registryIter->second);
-        CLOG(INFO, "Invariant") << "Enabled invariant '" << name << "'";
-    }
-    else
-    {
-        throw std::runtime_error{"Invariant " + name + " already enabled"};
-    }
 }
 
 void
@@ -170,12 +206,8 @@ InvariantManagerImpl::onInvariantFailure(std::shared_ptr<Invariant> invariant,
                                          std::string const& message,
                                          uint32_t ledger)
 {
-    mMetricsRegistry
-        .NewCounter(
-            {"invariant", "does-not-hold", "count", invariant->getName()})
-        .inc();
-    mFailureInformation[invariant->getName()].lastFailedOnLedger = ledger;
-    mFailureInformation[invariant->getName()].lastFailedWithMessage = message;
+    mInvariantFailureCount.inc();
+    mFailureInformation[invariant->getName()] = {ledger, message};
     handleInvariantFailure(invariant, message);
 }
 
@@ -186,11 +218,13 @@ InvariantManagerImpl::handleInvariantFailure(
     if (invariant->isStrict())
     {
         CLOG(FATAL, "Invariant") << message;
+        CLOG(FATAL, "Invariant") << REPORT_INTERNAL_BUG;
         throw InvariantDoesNotHold{message};
     }
     else
     {
         CLOG(ERROR, "Invariant") << message;
+        CLOG(ERROR, "Invariant") << REPORT_INTERNAL_BUG;
     }
 }
 }

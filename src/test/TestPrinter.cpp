@@ -3,62 +3,34 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "test/TestPrinter.h"
+#include "catchup/CatchupRange.h"
 #include "test/TestMarket.h"
-#include <lib/util/format.h>
+#include "util/XDRCereal.h"
+#include <fmt/format.h>
 
 namespace Catch
 {
-
-template <>
 std::string
-toString(stellar::ClaimOfferAtom const& coa)
-{
-    return xdr::xdr_to_string(coa);
-}
-
-template <>
-std::string
-toString(stellar::Hash const& tr)
-{
-    return xdr::xdr_to_string(tr);
-}
-
-template <>
-std::string
-toString(stellar::OfferEntry const& oe)
-{
-    return xdr::xdr_to_string(oe);
-}
-
-template <>
-std::string
-toString(stellar::OfferState const& os)
+StringMaker<stellar::OfferState>::convert(stellar::OfferState const& os)
 {
     return fmt::format(
         "selling: {}, buying: {}, price: {}, amount: {}, type: {}",
-        xdr::xdr_to_string(os.selling), xdr::xdr_to_string(os.buying),
-        xdr::xdr_to_string(os.price), os.amount,
+        xdr_to_string(os.selling), xdr_to_string(os.buying),
+        xdr_to_string(os.price), os.amount,
         os.type == stellar::OfferType::PASSIVE ? "passive" : "active");
 }
 
-template <>
 std::string
-toString(stellar::TransactionResult const& tr)
+StringMaker<stellar::CatchupRange>::convert(stellar::CatchupRange const& cr)
 {
-    return xdr::xdr_to_string(tr);
+    return fmt::format("[{},{}), applyBuckets: {}", cr.getReplayFirst(),
+                       cr.getReplayLimit(),
+                       cr.applyBuckets() ? cr.getBucketApplyLedger() : 0);
 }
 
-template <>
 std::string
-toString(stellar::CatchupRange const& cr)
-{
-    return fmt::format("[{}..{}], applyBuckets: {}", cr.first.first(),
-                       cr.first.last(), cr.second);
-}
-
-template <>
-std::string
-toString(stellar::historytestutils::CatchupPerformedWork const& cm)
+StringMaker<stellar::historytestutils::CatchupPerformedWork>::convert(
+    stellar::historytestutils::CatchupPerformedWork const& cm)
 {
     return fmt::format("{}, {}, {}, {}, {}, {}, {}, {}",
                        cm.mHistoryArchiveStatesDownloaded,

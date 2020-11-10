@@ -6,121 +6,123 @@
 #include "history/HistoryArchive.h"
 #include "historywork/GetRemoteFileWork.h"
 #include "ledger/LedgerManager.h"
-#include "lib/util/format.h"
 #include "main/Application.h"
+#include "main/ErrorMessages.h"
 #include "util/Logging.h"
+#include <Tracy.hpp>
+#include <fmt/format.h>
 #include <medida/meter.h>
 #include <medida/metrics_registry.h>
 
 namespace stellar
 {
-
 GetHistoryArchiveStateWork::GetHistoryArchiveStateWork(
-    Application& app, WorkParent& parent, std::string uniqueName,
-    HistoryArchiveState& state, uint32_t seq,
-    VirtualClock::duration const& initialDelay,
-    std::shared_ptr<HistoryArchive const> archive, size_t maxRetries)
-    : Work(app, parent, std::move(uniqueName), maxRetries)
-    , mState(state)
+    Application& app, uint32_t seq, std::shared_ptr<HistoryArchive> archive,
+    std::string mode, size_t maxRetries)
+    : Work(app, "get-archive-state", maxRetries)
     , mSeq(seq)
-    , mInitialDelay(initialDelay)
     , mArchive(archive)
+    , mRetries(maxRetries)
     , mLocalFilename(
           archive ? HistoryArchiveState::localName(app, archive->getName())
                   : app.getHistoryManager().localFilename(
                         HistoryArchiveState::baseName()))
-    , mGetHistoryArchiveStateStart(app.getMetrics().NewMeter(
-          {"history", "download-history-archive-state", "start"}, "event"))
     , mGetHistoryArchiveStateSuccess(app.getMetrics().NewMeter(
-          {"history", "download-history-archive-state", "success"}, "event"))
-    , mGetHistoryArchiveStateFailure(app.getMetrics().NewMeter(
-          {"history", "download-history-archive-state", "failure"}, "event"))
+          {"history", "download-history-archive-state" + std::move(mode),
+           "success"},
+          "event"))
 {
 }
 
-GetHistoryArchiveStateWork::~GetHistoryArchiveStateWork()
+static bool
+isWellKnown(uint32_t seq)
 {
-    clearChildren();
+    return seq == 0;
+}
+
+BasicWork::State
+GetHistoryArchiveStateWork::doWork()
+{
+    ZoneScoped;
+    if (mGetRemoteFile)
+    {
+        auto state = mGetRemoteFile->getState();
+        auto archive = mGetRemoteFile->getCurrentArchive();
+        if (state == State::WORK_SUCCESS)
+        {
+            try
+            {
+                mState.load(mLocalFilename);
+            }
+            catch (std::runtime_error& e)
+            {
+                CLOG(ERROR, "History")
+                    << "Error loading history state: " << e.what();
+                CLOG(ERROR, "History") << POSSIBLY_CORRUPTED_LOCAL_FS;
+                CLOG(ERROR, "History") << "OR";
+                CLOG(ERROR, "History") << POSSIBLY_CORRUPTED_HISTORY;
+                CLOG(ERROR, "History") << "OR";
+                CLOG(ERROR, "History") << UPGRADE_STELLAR_CORE;
+                return State::WORK_FAILURE;
+            }
+        }
+        else if (state == State::WORK_FAILURE && archive)
+        {
+            if (isWellKnown(mSeq))
+            {
+                // Archive is corrupt if it's missing a well-known file
+                CLOG(ERROR, "History") << fmt::format(
+                    "Could not download {} file: corrupt archive {}",
+                    HistoryArchiveState::wellKnownRemoteName(),
+                    archive->getName());
+            }
+            else
+            {
+                CLOG(ERROR, "History") << fmt::format(
+                    "Missing HAS for ledger {}: maybe stale archive {}",
+                    std::to_string(mSeq), archive->getName());
+            }
+        }
+        return state;
+    }
+
+    else
+    {
+        auto name = getRemoteName();
+        CLOG(INFO, "History") << "Downloading history archive state: " << name;
+        mGetRemoteFile = addWork<GetRemoteFileWork>(name, mLocalFilename,
+                                                    mArchive, mRetries);
+        return State::WORK_RUNNING;
+    }
+}
+
+void
+GetHistoryArchiveStateWork::doReset()
+{
+    mGetRemoteFile.reset();
+    std::remove(mLocalFilename.c_str());
+    mState = {};
+}
+
+void
+GetHistoryArchiveStateWork::onSuccess()
+{
+    mGetHistoryArchiveStateSuccess.Mark();
+    Work::onSuccess();
+}
+
+std::string
+GetHistoryArchiveStateWork::getRemoteName() const
+{
+    return isWellKnown(mSeq) ? HistoryArchiveState::wellKnownRemoteName()
+                             : HistoryArchiveState::remoteName(mSeq);
 }
 
 std::string
 GetHistoryArchiveStateWork::getStatus() const
 {
-    if (getState() == WORK_FAILURE_RETRY)
-    {
-        auto eta = getRetryETA();
-        return fmt::format("Awaiting checkpoint (ETA: {:d} seconds)", eta);
-    }
-    return Work::getStatus();
-}
-
-VirtualClock::duration
-GetHistoryArchiveStateWork::getRetryDelay() const
-{
-    if (mInitialDelay.count() != 0 && mRetries == 0)
-    {
-        return mInitialDelay;
-    }
-    return Work::getRetryDelay();
-}
-
-void
-GetHistoryArchiveStateWork::onReset()
-{
-    clearChildren();
-    std::remove(mLocalFilename.c_str());
-    addWork<GetRemoteFileWork>(mSeq == 0
-                                   ? HistoryArchiveState::wellKnownRemoteName()
-                                   : HistoryArchiveState::remoteName(mSeq),
-                               mLocalFilename, mArchive, getMaxRetries());
-
-    if (mSeq != 0 && mRetries == 0 && mInitialDelay.count() != 0)
-    {
-        // If this is our first reset (on addition) and we're fetching a
-        // known snapshot, immediately initiate a timed retry, to avoid
-        // cluttering the console with the initial-probe failure.
-        setState(WORK_FAILURE_RETRY);
-        scheduleRetry();
-    }
-    else
-    {
-        mGetHistoryArchiveStateStart.Mark();
-    }
-}
-
-void
-GetHistoryArchiveStateWork::onRun()
-{
-    try
-    {
-        mState.load(mLocalFilename);
-        scheduleSuccess();
-    }
-    catch (std::runtime_error& e)
-    {
-        CLOG(ERROR, "History") << "error loading history state: " << e.what();
-        scheduleFailure();
-    }
-}
-
-Work::State
-GetHistoryArchiveStateWork::onSuccess()
-{
-    mGetHistoryArchiveStateSuccess.Mark();
-    return Work::onSuccess();
-}
-
-void
-GetHistoryArchiveStateWork::onFailureRetry()
-{
-    mGetHistoryArchiveStateFailure.Mark();
-    Work::onFailureRetry();
-}
-
-void
-GetHistoryArchiveStateWork::onFailureRaise()
-{
-    mGetHistoryArchiveStateFailure.Mark();
-    Work::onFailureRaise();
+    std::string ledgerString = mSeq == 0 ? "current" : std::to_string(mSeq);
+    return fmt::format("Downloading state file {} for ledger {}",
+                       getRemoteName(), ledgerString);
 }
 }

@@ -5,7 +5,9 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "bucket/FutureBucket.h"
+#include "main/Config.h"
 #include "xdr/Stellar-types.h"
+
 #include <cereal/cereal.hpp>
 #include <memory>
 #include <string>
@@ -14,7 +16,12 @@
 namespace asio
 {
 typedef std::error_code error_code;
-};
+}
+
+namespace medida
+{
+class Meter;
+}
 
 namespace stellar
 {
@@ -57,12 +64,14 @@ struct HistoryArchiveState
 
     unsigned version{HISTORY_ARCHIVE_STATE_VERSION};
     std::string server;
+    std::string networkPassphrase;
     uint32_t currentLedger{0};
     std::vector<HistoryStateBucket> currentBuckets;
 
     HistoryArchiveState();
 
-    HistoryArchiveState(uint32_t ledgerSeq, BucketList& buckets);
+    HistoryArchiveState(uint32_t ledgerSeq, BucketList const& buckets,
+                        std::string const& networkPassphrase);
 
     static std::string baseName();
     static std::string wellKnownRemoteDir();
@@ -73,7 +82,7 @@ struct HistoryArchiveState
                                  std::string const& archiveName);
 
     // Return cumulative hash of the bucketlist for this archive state.
-    Hash getBucketListHash();
+    Hash getBucketListHash() const;
 
     // Return vector of buckets to fetch/apply to turn 'other' into 'this'.
     // Vector is sorted from largest/highest-numbered bucket to smallest/lowest,
@@ -89,22 +98,33 @@ struct HistoryArchiveState
     void
     serialize(Archive& ar)
     {
-        ar(CEREAL_NVP(version), CEREAL_NVP(server), CEREAL_NVP(currentLedger),
-           CEREAL_NVP(currentBuckets));
+        ar(CEREAL_NVP(version), CEREAL_NVP(server), CEREAL_NVP(currentLedger));
+        try
+        {
+            ar(CEREAL_NVP(networkPassphrase));
+        }
+        catch (cereal::Exception)
+        {
+            // networkPassphrase wasn't parsed.
+            // This is expected when the input file does not contain it.
+        }
+        ar(CEREAL_NVP(currentBuckets));
     }
 
     template <class Archive>
     void
     serialize(Archive& ar) const
     {
-        ar(CEREAL_NVP(version), CEREAL_NVP(server), CEREAL_NVP(currentLedger),
-           CEREAL_NVP(currentBuckets));
+        ar(CEREAL_NVP(version), CEREAL_NVP(server), CEREAL_NVP(currentLedger));
+        if (!networkPassphrase.empty())
+        {
+            ar(CEREAL_NVP(networkPassphrase));
+        }
+        ar(CEREAL_NVP(currentBuckets));
     }
 
-    // Return true if all the 'next' bucket-futures that can be resolved are
-    // ready to be (instantaneously) resolved, or false if a merge is still
-    // in progress on one or more of them.
-    bool futuresAllReady() const;
+    // Return true if all futures are in FB_CLEAR state
+    bool futuresAllClear() const;
 
     // Return true if all futures have already been resolved, otherwise false.
     bool futuresAllResolved() const;
@@ -124,18 +144,16 @@ struct HistoryArchiveState
 
     std::string toString() const;
     void fromString(std::string const& str);
+
+    void prepareForPublish(Application& app);
+    bool containsValidBuckets(Application& app) const;
 };
 
 class HistoryArchive : public std::enable_shared_from_this<HistoryArchive>
 {
-    std::string mName;
-    std::string mGetCmd;
-    std::string mPutCmd;
-    std::string mMkdirCmd;
-
   public:
-    HistoryArchive(std::string const& name, std::string const& getCmd,
-                   std::string const& putCmd, std::string const& mkdirCmd);
+    explicit HistoryArchive(Application& app,
+                            HistoryArchiveConfiguration const& config);
     ~HistoryArchive();
     bool hasGetCmd() const;
     bool hasPutCmd() const;
@@ -147,5 +165,16 @@ class HistoryArchive : public std::enable_shared_from_this<HistoryArchive>
     std::string putFileCmd(std::string const& local,
                            std::string const& remote) const;
     std::string mkdirCmd(std::string const& remoteDir) const;
+
+    void markSuccess();
+    void markFailure();
+
+    uint64_t getSuccessCount() const;
+    uint64_t getFailureCount() const;
+
+  private:
+    HistoryArchiveConfiguration mConfig;
+    medida::Meter& mSuccessMeter;
+    medida::Meter& mFailureMeter;
 };
 }

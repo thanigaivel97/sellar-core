@@ -6,6 +6,7 @@
 
 #include "herder/Herder.h"
 #include "herder/TxSetFrame.h"
+#include "medida/timer.h"
 #include "scp/SCPDriver.h"
 #include "xdr/Stellar-ledger.h"
 
@@ -13,7 +14,7 @@ namespace medida
 {
 class Counter;
 class Meter;
-class Timer;
+class Histogram;
 }
 
 namespace stellar
@@ -51,8 +52,6 @@ class HerderSCPDriver : public SCPDriver
 
     Herder::State getState() const;
 
-    void syncMetrics();
-
     ConsensusData*
     trackingSCP() const
     {
@@ -87,16 +86,22 @@ class HerderSCPDriver : public SCPDriver
         return mSCP;
     }
 
+    void recordSCPExecutionMetrics(uint64_t slotIndex);
+    void recordSCPEvent(uint64_t slotIndex, bool isNomination);
+    void recordSCPExternalizeEvent(uint64_t slotIndex, NodeID const& id,
+                                   bool forceUpdateSelf);
+
     // envelope handling
+    SCPEnvelopeWrapperPtr wrapEnvelope(SCPEnvelope const& envelope) override;
     void signEnvelope(SCPEnvelope& envelope) override;
-    bool verifyEnvelope(SCPEnvelope const& envelope) override;
     void emitEnvelope(SCPEnvelope const& envelope) override;
 
     // value validation
     SCPDriver::ValidationLevel validateValue(uint64_t slotIndex,
                                              Value const& value,
                                              bool nomination) override;
-    Value extractValidValue(uint64_t slotIndex, Value const& value) override;
+    ValueWrapperPtr extractValidValue(uint64_t slotIndex,
+                                      Value const& value) override;
 
     // value marshaling
     std::string toShortString(PublicKey const& pk) const override;
@@ -107,9 +112,13 @@ class HerderSCPDriver : public SCPDriver
                     std::chrono::milliseconds timeout,
                     std::function<void()> cb) override;
 
+    // hashing support
+    Hash getHashOf(std::vector<xdr::opaque_vec<>> const& vals) const override;
+
     // core SCP
-    Value combineCandidates(uint64_t slotIndex,
-                            std::set<Value> const& candidates) override;
+    ValueWrapperPtr
+    combineCandidates(uint64_t slotIndex,
+                      ValueWrapperPtrSet const& candidates) override;
     void valueExternalized(uint64_t slotIndex, Value const& value) override;
 
     // Submit a value to consider for slotIndex
@@ -132,6 +141,36 @@ class HerderSCPDriver : public SCPDriver
                                  SCPBallot const& ballot) override;
     void acceptedCommit(uint64_t slotIndex, SCPBallot const& ballot) override;
 
+    optional<VirtualClock::time_point> getPrepareStart(uint64_t slotIndex);
+
+    // converts a Value into a StellarValue
+    // returns false on error
+    bool toStellarValue(Value const& v, StellarValue& sv);
+
+    // validate close time as much as possible
+    bool checkCloseTime(uint64_t slotIndex, uint64_t lastCloseTime,
+                        StellarValue const& b) const;
+
+    // wraps a *valid* StellarValue (throws if it can't find txSet/qSet)
+    ValueWrapperPtr wrapStellarValue(StellarValue const& sv);
+
+    ValueWrapperPtr wrapValue(Value const& sv) override;
+
+    // clean up older slots
+    void purgeSlots(uint64_t maxSlotIndex);
+
+    // Does the nomination protocol output a BASIC or a SIGNED
+    // StellarValue?
+    virtual StellarValueType compositeValueType() const;
+
+    // Does the current protocol version contain the CAP-0034 closeTime
+    // semantics change?
+    bool curProtocolPreservesTxSetCloseTimeAffinity() const;
+
+    double getExternalizeLag(NodeID const& id) const;
+
+    Json::Value getQsetLagInfo(bool summary, bool fullKeys);
+
   private:
     Application& mApp;
     HerderImpl& mHerder;
@@ -140,37 +179,61 @@ class HerderSCPDriver : public SCPDriver
     PendingEnvelopes& mPendingEnvelopes;
     SCP mSCP;
 
+    static uint32_t const FIRST_PROTOCOL_WITH_TXSET_CLOSETIME_AFFINITY;
+
     struct SCPMetrics
     {
         medida::Meter& mEnvelopeSign;
-        medida::Meter& mEnvelopeValidSig;
-        medida::Meter& mEnvelopeInvalidSig;
 
         medida::Meter& mValueValid;
         medida::Meter& mValueInvalid;
 
-        medida::Meter& mValueExternalize;
-
         // listeners
-        medida::Meter& mQuorumHeard;
-        medida::Meter& mNominatingValue;
-        medida::Meter& mUpdatedCandidate;
-        medida::Meter& mStartBallotProtocol;
-        medida::Meter& mAcceptedBallotPrepared;
-        medida::Meter& mConfirmedBallotPrepared;
-        medida::Meter& mAcceptedCommit;
+        medida::Meter& mCombinedCandidates;
 
-        // State transition metrics
-        medida::Counter& mHerderStateCurrent;
-        medida::Timer& mHerderStateChanges;
+        // Timers for nomination and ballot protocols
+        medida::Timer& mNominateToPrepare;
+        medida::Timer& mPrepareToExternalize;
+
+        // Timers tracking externalize messages
+        medida::Timer& mExternalizeLag;
+        medida::Timer& mExternalizeDelay;
 
         SCPMetrics(Application& app);
     };
 
     SCPMetrics mSCPMetrics;
 
+    // Nomination timeouts per ledger
+    medida::Histogram& mNominateTimeout;
+    // Prepare timeouts per ledger
+    medida::Histogram& mPrepareTimeout;
+
+    // Externalize lag tracking for nodes in qset
+    std::unordered_map<NodeID, medida::Timer> mQSetLag;
+
+    struct SCPTiming
+    {
+        optional<VirtualClock::time_point> mNominationStart;
+        optional<VirtualClock::time_point> mPrepareStart;
+
+        // Nomination timeouts before first prepare
+        int64_t mNominationTimeoutCount{0};
+        // Prepare timeouts before externalize
+        int64_t mPrepareTimeoutCount{0};
+
+        // externalize timing information
+        optional<VirtualClock::time_point> mFirstExternalize;
+        optional<VirtualClock::time_point> mSelfExternalize;
+    };
+
+    // Map of time points for each slot to measure key protocol metrics:
+    // * nomination to first prepare
+    // * first prepare to externalize
+    std::map<uint64_t, SCPTiming> mSCPExecutionTimes;
+
     uint32_t mLedgerSeqNominating;
-    Value mCurrentValue;
+    ValueWrapperPtr mCurrentValue;
 
     // timers used by SCP
     // indexed by slotIndex, timerID
@@ -180,24 +243,31 @@ class HerderSCPDriver : public SCPDriver
     // herder keeps track of the consensus index and ballot
     // when not set, it just means that herder will try to snap to any slot that
     // reached consensus
+    // on startup, this can be set to a value persisted from the database
     std::unique_ptr<ConsensusData> mTrackingSCP;
 
-    // when losing track of consensus, records where we left off so that we
-    // ignore older ledgers (as we potentially receive old messages)
+    // when losing track of consensus, we remember the consensus value so that
+    // we can ignore older ledgers (as we potentially receive old messages)
+    // it only tracks actual consensus values (learned when externalizing)
     std::unique_ptr<ConsensusData> mLastTrackingSCP;
-
-    // Mark changes to mTrackingSCP in metrics.
-    VirtualClock::time_point mLastStateChange;
 
     void stateChanged();
 
-    SCPDriver::ValidationLevel
-    validateValueHelper(uint64_t slotIndex, StellarValue const& sv) const;
-
-    // returns true if the local instance is in a state compatible with
-    // this slot
-    bool isSlotCompatibleWithCurrentState(uint64_t slotIndex) const;
+    SCPDriver::ValidationLevel validateValueHelper(uint64_t slotIndex,
+                                                   StellarValue const& sv,
+                                                   bool nomination) const;
 
     void logQuorumInformation(uint64_t index);
+
+    void clearSCPExecutionEvents();
+
+    void timerCallbackWrapper(uint64_t slotIndex, int timerID,
+                              std::function<void()> cb);
+
+    void recordLogTiming(VirtualClock::time_point start,
+                         VirtualClock::time_point end, medida::Timer& timer,
+                         std::string const& logStr,
+                         std::chrono::nanoseconds threshold,
+                         uint64_t slotIndex);
 };
 }

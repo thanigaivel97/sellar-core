@@ -4,19 +4,20 @@
 
 #include "overlay/LoadManager.h"
 #include "database/Database.h"
-#include "lib/util/format.h"
 #include "main/Application.h"
 #include "main/Config.h"
 #include "overlay/OverlayManager.h"
+#include "overlay/OverlayMetrics.h"
 #include "util/Logging.h"
+#include "util/XDROperators.h"
 #include "util/types.h"
+#include <Tracy.hpp>
+#include <fmt/format.h>
 
 #include <chrono>
 
 namespace stellar
 {
-using xdr::operator<;
-
 LoadManager::LoadManager() : mPeerCosts(128)
 {
 }
@@ -124,7 +125,9 @@ LoadManager::maybeShedExcessLoad(Application& app)
                 .NewMeter({"overlay", "drop", "load-shed"}, "drop")
                 .Mark();
 
-            victim->drop();
+            victim->drop("causing too much load",
+                         Peer::DropDirection::WE_DROPPED_REMOTE,
+                         Peer::DropMode::IGNORE_WRITE_QUEUE);
 
             app.getClock().resetIdleCrankPercent();
         }
@@ -170,29 +173,30 @@ LoadManager::PeerContext::PeerContext(Application& app, NodeID const& node)
     : mApp(app)
     , mNode(node)
     , mWorkStart(app.getClock().now())
-    , mBytesSendStart(Peer::getByteWriteMeter(app).count())
-    , mBytesRecvStart(Peer::getByteReadMeter(app).count())
+    , mBytesSendStart(
+          app.getOverlayManager().getOverlayMetrics().mByteWrite.count())
+    , mBytesRecvStart(
+          app.getOverlayManager().getOverlayMetrics().mByteRead.count())
     , mSQLQueriesStart(app.getDatabase().getQueryMeter().count())
 {
 }
 
 LoadManager::PeerContext::~PeerContext()
 {
+    ZoneScoped;
     if (!isZero(mNode.ed25519()))
     {
         auto pc = mApp.getOverlayManager().getLoadManager().getPeerCosts(mNode);
         auto time = std::chrono::duration_cast<std::chrono::nanoseconds>(
             mApp.getClock().now() - mWorkStart);
-        auto send = Peer::getByteWriteMeter(mApp).count() - mBytesSendStart;
-        auto recv = Peer::getByteReadMeter(mApp).count() - mBytesRecvStart;
+        auto send =
+            mApp.getOverlayManager().getOverlayMetrics().mByteWrite.count() -
+            mBytesSendStart;
+        auto recv =
+            mApp.getOverlayManager().getOverlayMetrics().mByteRead.count() -
+            mBytesRecvStart;
         auto query =
             (mApp.getDatabase().getQueryMeter().count() - mSQLQueriesStart);
-        if (Logging::logTrace("Overlay"))
-            CLOG(TRACE, "Overlay")
-                << "Debiting peer " << mApp.getConfig().toShortString(mNode)
-                << " time:" << timeMag(time.count())
-                << " send:" << byteMag(send) << " recv:" << byteMag(recv)
-                << " query:" << query;
         pc->mTimeSpent.Mark(time.count());
         pc->mBytesSend.Mark(send);
         pc->mBytesRecv.Mark(recv);

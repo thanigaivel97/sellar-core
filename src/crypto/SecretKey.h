@@ -5,6 +5,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "crypto/KeyUtils.h"
+#include "util/XDROperators.h"
 #include "xdr/Stellar-types.h"
 
 #include <array>
@@ -13,8 +14,6 @@
 
 namespace stellar
 {
-
-using xdr::operator==;
 
 class ByteSlice;
 struct SecretValue;
@@ -25,6 +24,7 @@ class SecretKey
     using uint512 = xdr::opaque_array<64>;
     PublicKeyType mKeyType;
     uint512 mSecretKey;
+    PublicKey mPublicKey;
 
     struct Seed
     {
@@ -41,7 +41,7 @@ class SecretKey
     ~SecretKey();
 
     // Get the public key portion of this secret key.
-    PublicKey getPublicKey() const;
+    PublicKey const& getPublicKey() const;
 
     // Get the seed portion of this secret key as a StrKey string.
     SecretValue getStrKeySeed() const;
@@ -58,6 +58,19 @@ class SecretKey
     // Create a new, random secret key.
     static SecretKey random();
 
+#ifdef BUILD_TESTS
+    // Create a new, pseudo-random secret key drawn from the global weak
+    // non-cryptographic PRNG (which itself is seeded from command-line or
+    // deterministically). Do not under any circumstances use this for non-test
+    // key generation.
+    static SecretKey pseudoRandomForTesting();
+
+    // Same as above, but use a function-local PRNG seeded from the
+    // provided number. Again: do not under any circumstances use this
+    // for non-test key generation
+    static SecretKey pseudoRandomForTestingFromSeed(unsigned int seed);
+#endif
+
     // Decode a secret key from a provided StrKey seed value.
     static SecretKey fromStrKeySeed(std::string const& strKeySeed);
     static SecretKey
@@ -73,9 +86,24 @@ class SecretKey
     static SecretKey fromSeed(ByteSlice const& seed);
 
     bool
-    operator==(SecretKey const& rh)
+    operator==(SecretKey const& rh) const
     {
         return (mKeyType == rh.mKeyType) && (mSecretKey == rh.mSecretKey);
+    }
+
+    bool
+    operator<(SecretKey const& rh) const
+    {
+        if (mKeyType < rh.mKeyType)
+        {
+            return true;
+        }
+        if (mKeyType > rh.mKeyType)
+        {
+            return false;
+        }
+
+        return mSecretKey < rh.mSecretKey;
     }
 };
 
