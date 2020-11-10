@@ -3,19 +3,18 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "overlay/PeerAuth.h"
-#include "crypto/ECDH.h"
+#include "crypto/Curve25519.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "crypto/SecretKey.h"
 #include "main/Application.h"
 #include "main/Config.h"
 #include "util/Logging.h"
+#include "util/XDROperators.h"
 #include "xdrpp/marshal.h"
 
 namespace stellar
 {
-
-using xdr::operator==;
 
 // Certs expire every hour, are reissued every half hour.
 static const uint64_t expirationLimit = 3600;
@@ -37,8 +36,8 @@ makeAuthCert(Application& app, Curve25519Public const& pub)
 
 PeerAuth::PeerAuth(Application& app)
     : mApp(app)
-    , mECDHSecretKey(EcdhRandomSecret())
-    , mECDHPublicKey(EcdhDerivePublic(mECDHSecretKey))
+    , mECDHSecretKey(curve25519RandomSecret())
+    , mECDHPublicKey(curve25519DerivePublic(mECDHSecretKey))
     , mCert(makeAuthCert(app, mECDHPublicKey))
     , mSharedKeyCache(0xffff)
 {
@@ -59,7 +58,7 @@ PeerAuth::verifyRemoteAuthCert(NodeID const& remoteNode, AuthCert const& cert)
 {
     if (cert.expiration < mApp.timeNow())
     {
-        CLOG(ERROR, "Overlay")
+        CLOG(DEBUG, "Overlay")
             << "PeerAuth cert expired: "
             << "expired= " << cert.expiration << ", now=" << mApp.timeNow();
         return false;
@@ -76,14 +75,16 @@ HmacSha256Key
 PeerAuth::getSharedKey(Curve25519Public const& remotePublic,
                        Peer::PeerRole role)
 {
-    if (mSharedKeyCache.exists(remotePublic))
+    auto key = PeerSharedKeyId{remotePublic, role};
+    if (mSharedKeyCache.exists(key))
     {
-        return mSharedKeyCache.get(remotePublic);
+        return mSharedKeyCache.get(key);
     }
-    auto k = EcdhDeriveSharedKey(mECDHSecretKey, mECDHPublicKey, remotePublic,
-                                 role == Peer::WE_CALLED_REMOTE);
-    mSharedKeyCache.put(remotePublic, k);
-    return k;
+    auto value =
+        curve25519DeriveSharedKey(mECDHSecretKey, mECDHPublicKey, remotePublic,
+                                  role == Peer::WE_CALLED_REMOTE);
+    mSharedKeyCache.put(key, value);
+    return value;
 }
 
 HmacSha256Key

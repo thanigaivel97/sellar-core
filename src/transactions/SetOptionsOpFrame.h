@@ -8,6 +8,8 @@
 
 namespace stellar
 {
+class AbstractLedgerTxn;
+
 class SetOptionsOpFrame : public OperationFrame
 {
     ThresholdLevel getThresholdLevel() const override;
@@ -18,13 +20,16 @@ class SetOptionsOpFrame : public OperationFrame
     }
     SetOptionsOp const& mSetOptions;
 
+    bool addOrChangeSigner(AbstractLedgerTxn& ltx);
+    void deleteSigner(AbstractLedgerTxn& ltx, LedgerTxnHeader const& header,
+                      LedgerTxnEntry& sourceAccount);
+
   public:
     SetOptionsOpFrame(Operation const& op, OperationResult& res,
                       TransactionFrame& parentTx);
 
-    bool doApply(Application& app, LedgerDelta& delta,
-                 LedgerManager& ledgerManager) override;
-    bool doCheckValid(Application& app) override;
+    bool doApply(AbstractLedgerTxn& ltx) override;
+    bool doCheckValid(uint32_t ledgerVersion) override;
 
     static SetOptionsResultCode
     getInnerCode(OperationResult const& res)

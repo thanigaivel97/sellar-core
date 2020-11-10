@@ -2,21 +2,23 @@
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "herder/HerderImpl.h"
+#include "herder/HerderPersistence.h"
 #include "herder/HerderUtils.h"
 #include "herder/TxSetFrame.h"
 #include "main/Application.h"
 #include "main/Config.h"
+#include "overlay/OverlayManager.h"
 #include "scp/QuorumSetUtils.h"
+#include "scp/Slot.h"
 #include "util/Logging.h"
-#include <overlay/OverlayManager.h>
-#include <scp/Slot.h>
+#include <Tracy.hpp>
+#include <unordered_set>
 #include <xdrpp/marshal.h>
 
 using namespace std;
 
 #define QSET_CACHE_SIZE 10000
 #define TXSET_CACHE_SIZE 10000
-#define NODES_QUORUM_CACHE_SIZE 1000
 
 namespace stellar
 {
@@ -30,9 +32,20 @@ PendingEnvelopes::PendingEnvelopes(Application& app, HerderImpl& herder)
     , mQuorumSetFetcher(app, [](Peer::pointer peer,
                                 Hash hash) { peer->sendGetQuorumSet(hash); })
     , mTxSetCache(TXSET_CACHE_SIZE)
-    , mNodesInQuorum(NODES_QUORUM_CACHE_SIZE)
-    , mReadyEnvelopesSize(
-          app.getMetrics().NewCounter({"scp", "memory", "pending-envelopes"}))
+    , mValueSizeCache(TXSET_CACHE_SIZE + QSET_CACHE_SIZE)
+    , mRebuildQuorum(true)
+    , mQuorumTracker(mApp.getConfig().NODE_SEED.getPublicKey())
+    , mProcessedCount(
+          app.getMetrics().NewCounter({"scp", "pending", "processed"}))
+    , mDiscardedCount(
+          app.getMetrics().NewCounter({"scp", "pending", "discarded"}))
+    , mFetchingCount(
+          app.getMetrics().NewCounter({"scp", "pending", "fetching"}))
+    , mReadyCount(app.getMetrics().NewCounter({"scp", "pending", "ready"}))
+    , mFetchDuration(app.getMetrics().NewTimer({"scp", "fetch", "envelope"}))
+    , mFetchTxSetTimer(app.getMetrics().NewTimer({"overlay", "fetch", "txset"}))
+    , mFetchQsetTimer(app.getMetrics().NewTimer({"overlay", "fetch", "qset"}))
+    , mCostPerSlot(app.getMetrics().NewHistogram({"scp", "cost", "per-slot"}))
 {
 }
 
@@ -58,44 +71,78 @@ PendingEnvelopes::peerDoesntHave(MessageType type, Hash const& itemID,
     }
 }
 
-void
-PendingEnvelopes::addSCPQuorumSet(Hash hash, const SCPQuorumSet& q)
+SCPQuorumSetPtr
+PendingEnvelopes::getKnownQSet(Hash const& hash, bool touch)
 {
-    assert(isQuorumSetSane(q, false));
+    SCPQuorumSetPtr res;
+    auto it = mKnownQSets.find(hash);
+    if (it != mKnownQSets.end())
+    {
+        res = it->second.lock();
+    }
 
-    CLOG(TRACE, "Herder") << "Add SCPQSet " << hexAbbrev(hash);
+    // refresh the cache for this key
+    if (res && touch)
+    {
+        mQsetCache.put(hash, res);
+    }
+    return res;
+}
 
-    SCPQuorumSetPtr qset(new SCPQuorumSet(q));
-    mQsetCache.put(hash, qset);
-    mQuorumSetFetcher.recv(hash);
+SCPQuorumSetPtr
+PendingEnvelopes::putQSet(Hash const& qSetHash, SCPQuorumSet const& qSet)
+{
+    CLOG(TRACE, "Herder") << "Add SCPQSet " << hexAbbrev(qSetHash);
+    SCPQuorumSetPtr res;
+    const char* errString = nullptr;
+    assert(isQuorumSetSane(qSet, false, errString));
+    res = getKnownQSet(qSetHash, true);
+    if (!res)
+    {
+        res = std::make_shared<SCPQuorumSet>(qSet);
+        mKnownQSets[qSetHash] = res;
+        mQsetCache.put(qSetHash, res);
+    }
+    return res;
+}
+
+void
+PendingEnvelopes::addSCPQuorumSet(Hash const& hash, SCPQuorumSet const& q)
+{
+    ZoneScoped;
+    putQSet(hash, q);
+    mQuorumSetFetcher.recv(hash, mFetchQsetTimer);
 }
 
 bool
-PendingEnvelopes::recvSCPQuorumSet(Hash hash, const SCPQuorumSet& q)
+PendingEnvelopes::recvSCPQuorumSet(Hash const& hash, SCPQuorumSet const& q)
 {
+    ZoneScoped;
     CLOG(TRACE, "Herder") << "Got SCPQSet " << hexAbbrev(hash);
 
     auto lastSeenSlotIndex = mQuorumSetFetcher.getLastSeenSlotIndex(hash);
-    if (lastSeenSlotIndex <= 0)
+    if (lastSeenSlotIndex == 0)
     {
         return false;
     }
 
-    if (isQuorumSetSane(q, false))
+    const char* errString = nullptr;
+    bool res = isQuorumSetSane(q, false, errString);
+    if (res)
     {
         addSCPQuorumSet(hash, q);
-        return true;
     }
     else
     {
         discardSCPEnvelopesWithQSet(hash);
-        return false;
     }
+    return res;
 }
 
 void
-PendingEnvelopes::discardSCPEnvelopesWithQSet(Hash hash)
+PendingEnvelopes::discardSCPEnvelopesWithQSet(Hash const& hash)
 {
+    ZoneScoped;
     CLOG(TRACE, "Herder") << "Discarding SCP Envelopes with SCPQSet "
                           << hexAbbrev(hash);
 
@@ -105,18 +152,89 @@ PendingEnvelopes::discardSCPEnvelopesWithQSet(Hash hash)
 }
 
 void
-PendingEnvelopes::addTxSet(Hash hash, uint64 lastSeenSlotIndex,
+PendingEnvelopes::updateMetrics()
+{
+    int64 processed = 0;
+    int64 discarded = 0;
+    int64 fetching = 0;
+    int64 ready = 0;
+
+    for (auto const& s : mEnvelopes)
+    {
+        auto& v = s.second;
+        processed += v.mProcessedEnvelopes.size();
+        discarded += v.mDiscardedEnvelopes.size();
+        fetching += v.mFetchingEnvelopes.size();
+        ready += v.mReadyEnvelopes.size();
+    }
+    TracyPlot("scp.pending.processed", processed);
+    TracyPlot("scp.pending.fetching", fetching);
+    mProcessedCount.set_count(processed);
+    mDiscardedCount.set_count(discarded);
+    mFetchingCount.set_count(fetching);
+    mReadyCount.set_count(ready);
+}
+
+TxSetFramePtr
+PendingEnvelopes::putTxSet(Hash const& hash, uint64 slot, TxSetFramePtr txset)
+{
+    auto res = getKnownTxSet(hash, slot, true);
+    if (!res)
+    {
+        res = txset;
+        mKnownTxSets[hash] = res;
+        mTxSetCache.put(hash, std::make_pair(slot, res));
+    }
+    return res;
+}
+
+// tries to find a txset in memory, setting touch also touches the LRU,
+// extending the lifetime of the result *and* updating the slot number
+// to a greater value if needed
+TxSetFramePtr
+PendingEnvelopes::getKnownTxSet(Hash const& hash, uint64 slot, bool touch)
+{
+    // slot is only used when `touch` is set
+    assert(touch || (slot == 0));
+    TxSetFramePtr res;
+    auto it = mKnownTxSets.find(hash);
+    if (it != mKnownTxSets.end())
+    {
+        res = it->second.lock();
+    }
+
+    // refresh the cache for this key
+    if (res && touch)
+    {
+        bool update = true;
+        if (mTxSetCache.exists(hash))
+        {
+            auto& v = mTxSetCache.get(hash);
+            update = (slot > v.first);
+        }
+        if (update)
+        {
+            mTxSetCache.put(hash, std::make_pair(slot, res));
+        }
+    }
+    return res;
+}
+
+void
+PendingEnvelopes::addTxSet(Hash const& hash, uint64 lastSeenSlotIndex,
                            TxSetFramePtr txset)
 {
+    ZoneScoped;
     CLOG(TRACE, "Herder") << "Add TxSet " << hexAbbrev(hash);
 
-    mTxSetCache.put(hash, std::make_pair(lastSeenSlotIndex, txset));
-    mTxSetFetcher.recv(hash);
+    putTxSet(hash, lastSeenSlotIndex, txset);
+    mTxSetFetcher.recv(hash, mFetchTxSetTimer);
 }
 
 bool
-PendingEnvelopes::recvTxSet(Hash hash, TxSetFramePtr txset)
+PendingEnvelopes::recvTxSet(Hash const& hash, TxSetFramePtr txset)
 {
+    ZoneScoped;
     CLOG(TRACE, "Herder") << "Got TxSet " << hexAbbrev(hash);
 
     auto lastSeenSlotIndex = mTxSetFetcher.getLastSeenSlotIndex(hash);
@@ -130,49 +248,39 @@ PendingEnvelopes::recvTxSet(Hash hash, TxSetFramePtr txset)
 }
 
 bool
-PendingEnvelopes::isNodeInQuorum(NodeID const& node)
+PendingEnvelopes::isNodeDefinitelyInQuorum(NodeID const& node)
 {
-    bool res;
-
-    res = mNodesInQuorum.exists(node);
-    if (res)
+    if (mRebuildQuorum)
     {
-        res = mNodesInQuorum.get(node);
+        rebuildQuorumTrackerState();
+        mRebuildQuorum = false;
     }
+    return mQuorumTracker.isNodeDefinitelyInQuorum(node);
+}
 
-    if (!res)
+static std::string
+txSetsToStr(SCPEnvelope const& envelope)
+{
+    auto hashes = getTxSetHashes(envelope);
+    std::unordered_set<Hash> hashesSet(hashes.begin(), hashes.end());
+    std::string res = "[";
+    for (auto const& s : hashesSet)
     {
-        // search through the known slots
-        SCP::TriBool r = mHerder.getSCP().isNodeInQuorum(node);
-        if (r == SCP::TB_TRUE)
-        {
-            // only cache positive answers
-            // so that nodes can be added during rounds
-            mNodesInQuorum.put(node, true);
-            res = true;
-        }
-        else if (r == SCP::TB_FALSE)
-        {
-            res = false;
-        }
-        else
-        {
-            // MAYBE -> return true, but don't cache
-            res = true;
-        }
+        res += hexAbbrev(s);
+        res += " ";
     }
-
-    return res;
+    return res + "]";
 }
 
 // called from Peer and when an Item tracker completes
 Herder::EnvelopeStatus
 PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
 {
+    ZoneScoped;
     auto const& nodeID = envelope.statement.nodeID;
-    if (!isNodeInQuorum(nodeID))
+    if (!isNodeDefinitelyInQuorum(nodeID))
     {
-        CLOG(DEBUG, "Herder")
+        CLOG(TRACE, "Herder")
             << "Dropping envelope from "
             << mApp.getConfig().toShortString(nodeID) << " (not in quorum)";
         return Herder::ENVELOPE_STATUS_DISCARDED;
@@ -192,20 +300,21 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
 
         touchFetchCache(envelope);
 
-        auto& set = mEnvelopes[envelope.statement.slotIndex].mFetchingEnvelopes;
-        auto& processedList =
-            mEnvelopes[envelope.statement.slotIndex].mProcessedEnvelopes;
+        auto& envs = mEnvelopes[envelope.statement.slotIndex];
+        auto& fetching = envs.mFetchingEnvelopes;
+        auto& processed = envs.mProcessedEnvelopes;
 
-        auto fetching = find(set.begin(), set.end(), envelope);
+        auto fetchIt = fetching.find(envelope);
 
-        if (fetching == set.end())
+        if (fetchIt == fetching.end())
         { // we aren't fetching this envelope
-            if (find(processedList.begin(), processedList.end(), envelope) ==
-                processedList.end())
+            if (processed.find(envelope) == processed.end())
             { // we haven't seen this envelope before
                 // insert it into the fetching set
-                fetching = set.insert(envelope).first;
+                fetchIt =
+                    fetching.emplace(envelope, mApp.getClock().now()).first;
                 startFetch(envelope);
+                updateMetrics();
             }
             else
             {
@@ -218,12 +327,36 @@ PendingEnvelopes::recvSCPEnvelope(SCPEnvelope const& envelope)
         // check if we are done fetching it
         if (isFullyFetched(envelope))
         {
+            std::chrono::nanoseconds durationNano =
+                mApp.getClock().now() - fetchIt->second;
+            mFetchDuration.Update(durationNano);
+            Hash h = Slot::getCompanionQuorumSetHashFromStatement(
+                envelope.statement);
+            if (Logging::logTrace("Perf"))
+            {
+                CLOG(TRACE, "Perf")
+                    << "Herder fetched for envelope "
+                    << hexAbbrev(sha256(xdr::xdr_to_opaque(envelope)))
+                    << " with txsets " << txSetsToStr(envelope) << " and qset "
+                    << hexAbbrev(h) << " in "
+                    << std::chrono::duration<double>(durationNano).count()
+                    << " seconds";
+            }
+
             // move the item from fetching to processed
-            processedList.emplace_back(*fetching);
-            set.erase(fetching);
+            processed.emplace(envelope);
+            fetching.erase(fetchIt);
+
             envelopeReady(envelope);
+            updateMetrics();
             return Herder::ENVELOPE_STATUS_READY;
-        } // else just keep waiting for it to come in
+        }
+        else
+        {
+            // else just keep waiting for it to come in
+            // and refresh fetchers as needed
+            startFetch(envelope);
+        }
 
         return Herder::ENVELOPE_STATUS_FETCHING;
     }
@@ -241,18 +374,16 @@ PendingEnvelopes::discardSCPEnvelope(SCPEnvelope const& envelope)
 {
     try
     {
-        if (isDiscarded(envelope))
+        auto& envs = mEnvelopes[envelope.statement.slotIndex];
+        auto& discardedSet = envs.mDiscardedEnvelopes;
+        auto r = discardedSet.insert(envelope);
+
+        if (!r.second)
         {
             return;
         }
 
-        auto& discardedSet =
-            mEnvelopes[envelope.statement.slotIndex].mDiscardedEnvelopes;
-        discardedSet.insert(envelope);
-
-        auto& fetchingSet =
-            mEnvelopes[envelope.statement.slotIndex].mFetchingEnvelopes;
-        fetchingSet.erase(envelope);
+        envs.mFetchingEnvelopes.erase(envelope);
 
         stopFetch(envelope);
     }
@@ -262,6 +393,7 @@ PendingEnvelopes::discardSCPEnvelope(SCPEnvelope const& envelope)
             << "PendingEnvelopes::discardSCPEnvelope got corrupt message: "
             << e.what();
     }
+    updateMetrics();
 }
 
 bool
@@ -274,65 +406,194 @@ PendingEnvelopes::isDiscarded(SCPEnvelope const& envelope) const
     }
 
     auto& discardedSet = envelopes->second.mDiscardedEnvelopes;
-    auto discarded =
-        std::find(std::begin(discardedSet), std::end(discardedSet), envelope);
+    auto discarded = discardedSet.find(envelope);
     return discarded != discardedSet.end();
+}
+
+void
+PendingEnvelopes::cleanKnownData()
+{
+    auto it = mKnownQSets.begin();
+    while (it != mKnownQSets.end())
+    {
+        if (it->second.expired())
+        {
+            it = mKnownQSets.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    auto it2 = mKnownTxSets.begin();
+    while (it2 != mKnownTxSets.end())
+    {
+        if (it2->second.expired())
+        {
+            it2 = mKnownTxSets.erase(it2);
+        }
+        else
+        {
+            ++it2;
+        }
+    }
+}
+
+#ifdef BUILD_TESTS
+void
+PendingEnvelopes::clearQSetCache()
+{
+    mQsetCache.clear();
+    mKnownQSets.clear();
+}
+#endif
+
+void
+PendingEnvelopes::recordReceivedCost(SCPEnvelope const& env)
+{
+    ZoneScoped;
+
+    if (!mQuorumTracker.isNodeDefinitelyInQuorum(env.statement.nodeID))
+    {
+        return;
+    }
+
+    // Record cost received from this validator
+    size_t totalReceivedBytes = 0;
+    totalReceivedBytes += xdr::xdr_argpack_size(env);
+
+    for (auto const& v : getStellarValues(env.statement))
+    {
+        size_t txSetSize = 0;
+        if (mValueSizeCache.exists(v.txSetHash))
+        {
+            txSetSize = mValueSizeCache.get(v.txSetHash);
+        }
+        else
+        {
+            auto txSetPtr = getTxSet(v.txSetHash);
+            if (txSetPtr)
+            {
+                TransactionSet txSet;
+                txSetPtr->toXDR(txSet);
+                txSetSize = xdr::xdr_argpack_size(txSet);
+                mValueSizeCache.put(v.txSetHash, txSetSize);
+            }
+        }
+
+        totalReceivedBytes += txSetSize;
+    }
+
+    auto qSetHash = Slot::getCompanionQuorumSetHashFromStatement(env.statement);
+    size_t qSetSize = 0;
+
+    if (mValueSizeCache.exists(qSetHash))
+    {
+        qSetSize = mValueSizeCache.get(qSetHash);
+    }
+    else
+    {
+        auto qSetPtr = getQSet(qSetHash);
+        if (qSetPtr)
+        {
+            qSetSize = xdr::xdr_argpack_size(*qSetPtr);
+            mValueSizeCache.put(qSetHash, qSetSize);
+        }
+    }
+
+    totalReceivedBytes += qSetSize;
+
+    if (totalReceivedBytes > 0)
+    {
+        auto const& tracked =
+            mQuorumTracker.findClosestValidators(env.statement.nodeID);
+        auto& cost = mEnvelopes[env.statement.slotIndex].mReceivedCost;
+        for (auto& t : tracked)
+        {
+            cost[t] += totalReceivedBytes;
+        }
+    }
 }
 
 void
 PendingEnvelopes::envelopeReady(SCPEnvelope const& envelope)
 {
+    ZoneScoped;
+    auto slot = envelope.statement.slotIndex;
+    if (Logging::logTrace("Herder"))
+    {
+        CLOG(TRACE, "Herder")
+            << "Envelope ready "
+            << hexAbbrev(sha256(xdr::xdr_to_opaque(envelope))) << " i:" << slot
+            << " t:" << envelope.statement.pledges.type();
+    }
+
+    // envelope has been fetched completely, but SCP has not done
+    // any validation on values yet. Regardless, record cost of this
+    // envelope.
+    recordReceivedCost(envelope);
+
     StellarMessage msg;
     msg.type(SCP_MESSAGE);
     msg.envelope() = envelope;
     mApp.getOverlayManager().broadcastMessage(msg);
 
-    mEnvelopes[envelope.statement.slotIndex].mReadyEnvelopes.push_back(
-        envelope);
-
-    CLOG(TRACE, "Herder") << "Envelope ready i:" << envelope.statement.slotIndex
-                          << " t:" << envelope.statement.pledges.type();
+    auto envW = mHerder.getHerderSCPDriver().wrapEnvelope(envelope);
+    mEnvelopes[slot].mReadyEnvelopes.push_back(envW);
 }
 
 bool
 PendingEnvelopes::isFullyFetched(SCPEnvelope const& envelope)
 {
-    if (!mQsetCache.exists(
-            Slot::getCompanionQuorumSetHashFromStatement(envelope.statement)))
+    if (!getKnownQSet(
+            Slot::getCompanionQuorumSetHashFromStatement(envelope.statement),
+            false))
+    {
         return false;
+    }
 
     auto txSetHashes = getTxSetHashes(envelope);
     return std::all_of(std::begin(txSetHashes), std::end(txSetHashes),
-                       [this](Hash const& txSetHash) {
-                           return mTxSetCache.exists(txSetHash);
+                       [&](Hash const& txSetHash) {
+                           return getKnownTxSet(txSetHash, 0, false);
                        });
 }
 
 void
 PendingEnvelopes::startFetch(SCPEnvelope const& envelope)
 {
+    ZoneScoped;
     Hash h = Slot::getCompanionQuorumSetHashFromStatement(envelope.statement);
 
-    if (!mQsetCache.exists(h))
+    bool needSomething = false;
+    if (!getKnownQSet(h, false))
     {
         mQuorumSetFetcher.fetch(h, envelope);
+        needSomething = true;
     }
 
     for (auto const& h2 : getTxSetHashes(envelope))
     {
-        if (!mTxSetCache.exists(h2))
+        if (!getKnownTxSet(h2, 0, false))
         {
             mTxSetFetcher.fetch(h2, envelope);
+            needSomething = true;
         }
     }
 
-    CLOG(TRACE, "Herder") << "StartFetch i:" << envelope.statement.slotIndex
-                          << " t:" << envelope.statement.pledges.type();
+    if (needSomething && Logging::logTrace("Herder"))
+    {
+        CLOG(TRACE, "Herder") << "StartFetch env "
+                              << hexAbbrev(sha256(xdr::xdr_to_opaque(envelope)))
+                              << " i:" << envelope.statement.slotIndex
+                              << " t:" << envelope.statement.pledges.type();
+    }
 }
 
 void
 PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
 {
+    ZoneScoped;
     Hash h = Slot::getCompanionQuorumSetHashFromStatement(envelope.statement);
     mQuorumSetFetcher.stopFetch(h, envelope);
 
@@ -341,8 +602,13 @@ PendingEnvelopes::stopFetch(SCPEnvelope const& envelope)
         mTxSetFetcher.stopFetch(h2, envelope);
     }
 
-    CLOG(TRACE, "Herder") << "StopFetch i:" << envelope.statement.slotIndex
-                          << " t:" << envelope.statement.pledges.type();
+    if (Logging::logTrace("Herder"))
+    {
+        CLOG(TRACE, "Herder") << "StopFetch env "
+                              << hexAbbrev(sha256(xdr::xdr_to_opaque(envelope)))
+                              << " i:" << envelope.statement.slotIndex
+                              << " t:" << envelope.statement.pledges.type();
+    }
 }
 
 void
@@ -350,24 +616,16 @@ PendingEnvelopes::touchFetchCache(SCPEnvelope const& envelope)
 {
     auto qsetHash =
         Slot::getCompanionQuorumSetHashFromStatement(envelope.statement);
-    if (mQsetCache.exists(qsetHash))
-    {
-        // touch LRU
-        mQsetCache.get(qsetHash);
-    }
+    getKnownQSet(qsetHash, true);
 
     for (auto const& h : getTxSetHashes(envelope))
     {
-        if (mTxSetCache.exists(h))
-        {
-            auto& item = mTxSetCache.get(h);
-            item.first = std::max(item.first, envelope.statement.slotIndex);
-        }
+        getKnownTxSet(h, envelope.statement.slotIndex, true);
     }
 }
 
-bool
-PendingEnvelopes::pop(uint64 slotIndex, SCPEnvelope& ret)
+SCPEnvelopeWrapperPtr
+PendingEnvelopes::pop(uint64 slotIndex)
 {
     auto it = mEnvelopes.begin();
     while (it != mEnvelopes.end() && slotIndex >= it->first)
@@ -375,14 +633,15 @@ PendingEnvelopes::pop(uint64 slotIndex, SCPEnvelope& ret)
         auto& v = it->second.mReadyEnvelopes;
         if (v.size() != 0)
         {
-            ret = v.back();
+            auto ret = v.back();
             v.pop_back();
 
-            return true;
+            updateMetrics();
+            return ret;
         }
         it++;
     }
-    return false;
+    return nullptr;
 }
 
 vector<uint64>
@@ -400,6 +659,11 @@ PendingEnvelopes::readySlots()
 void
 PendingEnvelopes::eraseBelow(uint64 slotIndex)
 {
+    stopAllBelow(slotIndex);
+
+    // report only for the highest slot that we're purging
+    reportCostOutliersForSlot(slotIndex - 1, true);
+
     for (auto iter = mEnvelopes.begin(); iter != mEnvelopes.end();)
     {
         if (iter->first < slotIndex)
@@ -415,54 +679,76 @@ PendingEnvelopes::eraseBelow(uint64 slotIndex)
     mTxSetCache.erase_if([&](TxSetFramCacheItem const& i) {
         return i.first != 0 && i.first < slotIndex;
     });
+
+    cleanKnownData();
+    updateMetrics();
 }
 
 void
-PendingEnvelopes::slotClosed(uint64 slotIndex)
+PendingEnvelopes::stopAllBelow(uint64 slotIndex)
 {
-    // stop processing envelopes & downloads for the slot falling off the
-    // window
-    if (slotIndex > Herder::MAX_SLOTS_TO_REMEMBER)
+    // Before we purge a slot, check if any envelopes are still in
+    // "fetching" mode and attempt to record cost
+    for (auto it = mEnvelopes.begin();
+         it != mEnvelopes.end() && it->first < slotIndex; it++)
     {
-        slotIndex -= Herder::MAX_SLOTS_TO_REMEMBER;
-
-        mEnvelopes.erase(slotIndex);
-
-        mTxSetFetcher.stopFetchingBelow(slotIndex + 1);
-        mQuorumSetFetcher.stopFetchingBelow(slotIndex + 1);
-
-        mTxSetCache.erase_if(
-            [&](TxSetFramCacheItem const& i) { return i.first == slotIndex; });
+        auto& envs = it->second;
+        for (auto const& env : envs.mFetchingEnvelopes)
+        {
+            recordReceivedCost(env.first);
+        }
     }
+    mTxSetFetcher.stopFetchingBelow(slotIndex);
+    mQuorumSetFetcher.stopFetchingBelow(slotIndex);
+}
+
+void
+PendingEnvelopes::forceRebuildQuorum()
+{
+    // force recomputing the transitive quorum
+    mRebuildQuorum = true;
 }
 
 TxSetFramePtr
 PendingEnvelopes::getTxSet(Hash const& hash)
 {
-    if (mTxSetCache.exists(hash))
-    {
-        return mTxSetCache.get(hash).second;
-    }
-
-    return TxSetFramePtr();
+    return getKnownTxSet(hash, 0, false);
 }
 
 SCPQuorumSetPtr
 PendingEnvelopes::getQSet(Hash const& hash)
 {
-    if (mQsetCache.exists(hash))
+    auto qset = getKnownQSet(hash, false);
+    if (qset)
     {
-        return mQsetCache.get(hash);
+        return qset;
     }
-
-    return SCPQuorumSetPtr();
+    // if it was not known, see if we can find it somewhere else
+    auto& scp = mHerder.getSCP();
+    if (hash == scp.getLocalNode()->getQuorumSetHash())
+    {
+        qset = make_shared<SCPQuorumSet>(scp.getLocalQuorumSet());
+    }
+    else
+    {
+        auto& db = mApp.getDatabase();
+        qset = HerderPersistence::getQuorumSet(db, db.getSession(), hash);
+    }
+    if (qset)
+    {
+        qset = putQSet(hash, *qset);
+    }
+    return qset;
 }
 
-void
-PendingEnvelopes::dumpInfo(Json::Value& ret, size_t limit)
+Json::Value
+PendingEnvelopes::getJsonInfo(size_t limit)
 {
-    Json::Value& q = ret["queue"];
+    Json::Value ret;
 
+    updateMetrics();
+
+    auto& scp = mHerder.getSCP();
     {
         auto it = mEnvelopes.rbegin();
         size_t l = limit;
@@ -470,22 +756,228 @@ PendingEnvelopes::dumpInfo(Json::Value& ret, size_t limit)
         {
             if (it->second.mFetchingEnvelopes.size() != 0)
             {
-                Json::Value& slot = q[std::to_string(it->first)]["fetching"];
-                for (auto const& e : it->second.mFetchingEnvelopes)
+                Json::Value& slot = ret[std::to_string(it->first)]["fetching"];
+                for (auto const& kv : it->second.mFetchingEnvelopes)
                 {
-                    slot.append(mHerder.getSCP().envToStr(e));
+                    slot.append(scp.envToStr(kv.first));
                 }
             }
             if (it->second.mReadyEnvelopes.size() != 0)
             {
-                Json::Value& slot = q[std::to_string(it->first)]["pending"];
+                Json::Value& slot = ret[std::to_string(it->first)]["pending"];
                 for (auto const& e : it->second.mReadyEnvelopes)
                 {
-                    slot.append(mHerder.getSCP().envToStr(e));
+                    slot.append(scp.envToStr(e->getEnvelope()));
                 }
             }
             it++;
         }
     }
+    return ret;
+}
+
+void
+PendingEnvelopes::rebuildQuorumTrackerState()
+{
+    // rebuild quorum information using data sources starting with the
+    // freshest source
+    mQuorumTracker.rebuild([&](NodeID const& id) -> SCPQuorumSetPtr {
+        SCPQuorumSetPtr res;
+        if (id == mHerder.getSCP().getLocalNodeID())
+        {
+            res = getQSet(mHerder.getSCP().getLocalNode()->getQuorumSetHash());
+        }
+        else
+        {
+            auto m = mHerder.getSCP().getLatestMessage(id);
+            if (m != nullptr)
+            {
+                auto h =
+                    Slot::getCompanionQuorumSetHashFromStatement(m->statement);
+                res = getQSet(h);
+            }
+            if (res == nullptr)
+            {
+                // see if we had some information for that node
+                auto& db = mApp.getDatabase();
+                auto h = HerderPersistence::getNodeQuorumSet(
+                    db, db.getSession(), id);
+                if (h)
+                {
+                    res = getQSet(*h);
+                }
+            }
+        }
+        return res;
+    });
+}
+
+QuorumTracker::QuorumMap const&
+PendingEnvelopes::getCurrentlyTrackedQuorum() const
+{
+    return mQuorumTracker.getQuorum();
+}
+
+void
+PendingEnvelopes::envelopeProcessed(SCPEnvelope const& env)
+{
+    auto const& st = env.statement;
+    auto const& id = st.nodeID;
+
+    auto h = Slot::getCompanionQuorumSetHashFromStatement(st);
+
+    SCPQuorumSetPtr qset = getQSet(h);
+    if (!mQuorumTracker.expand(id, qset))
+    {
+        // could not expand quorum, queue up a rebuild
+        mRebuildQuorum = true;
+    }
+}
+
+std::unordered_map<NodeID, size_t>
+PendingEnvelopes::getCostPerValidator(uint64 slotIndex) const
+{
+    auto found = mEnvelopes.find(slotIndex);
+    if (found != mEnvelopes.end())
+    {
+        return found->second.mReceivedCost;
+    }
+    return {};
+}
+
+static bool
+shouldReportCostOutlier(double possibleOutlierCost, double expectedCost,
+                        double ratioLimit)
+{
+    if (possibleOutlierCost <= 0 || expectedCost <= 0)
+    {
+        CLOG(ERROR, "SCP") << "Unexpected k-means value: must be positive";
+        return false;
+    }
+
+    if (possibleOutlierCost / expectedCost > ratioLimit)
+    {
+        // If we're off by too much from the selected cluster, report the value
+        return true;
+    }
+    return false;
+}
+
+void
+PendingEnvelopes::reportCostOutliersForSlot(int64_t slotIndex,
+                                            bool updateMetrics) const
+{
+    ZoneScoped;
+
+    const uint32_t K_MEAN_NUM_CLUSTERS = 3;
+    const double OUTLIER_COST_RATIO_LIMIT = 10;
+
+    auto tracked = getCostPerValidator(slotIndex);
+    if (tracked.empty())
+    {
+        return;
+    }
+
+    std::vector<double> myValidatorsTrackedCost;
+    double totalCost = 0;
+
+    for (auto const& t : tracked)
+    {
+        if (t.second > 0)
+        {
+            double cost = static_cast<double>(t.second);
+            myValidatorsTrackedCost.push_back(cost);
+            totalCost += cost;
+        }
+    }
+
+    // Compare each node to other nodes we heard from for this slot
+    // Note: do not include cost from self as it's much smaller and will
+    // likely skew the data
+    if (myValidatorsTrackedCost.size() > 1)
+    {
+        auto numClusters =
+            std::min(static_cast<uint32_t>(myValidatorsTrackedCost.size()),
+                     K_MEAN_NUM_CLUSTERS);
+        auto clusters = k_means(myValidatorsTrackedCost, numClusters);
+
+        if (clusters.empty() || *(clusters.begin()) <= 0)
+        {
+            CLOG(ERROR, "SCP")
+                << "Expected non-empty set of positive cluster centers";
+        }
+        else
+        {
+            Json::Value res;
+            for (auto const& t : tracked)
+            {
+                auto clusterToCompare =
+                    closest_cluster(static_cast<double>(t.second), clusters);
+                auto const smallestCluster = *(clusters.begin());
+                if (shouldReportCostOutlier(clusterToCompare, smallestCluster,
+                                            OUTLIER_COST_RATIO_LIMIT))
+                {
+                    res[mApp.getConfig().toShortString(t.first)] =
+                        static_cast<Json::UInt64>(t.second);
+                }
+            }
+
+            Json::FastWriter fw;
+            if (!res.empty())
+            {
+                CLOG(WARNING, "SCP") << "High validator costs for slot "
+                                     << slotIndex << ": " << fw.write(res);
+            }
+        }
+    }
+
+    if (updateMetrics && totalCost > 0)
+    {
+        mCostPerSlot.Update(static_cast<int64_t>(totalCost));
+    }
+}
+
+Json::Value
+PendingEnvelopes::getJsonValidatorCost(bool summary, bool fullKeys,
+                                       uint64 index) const
+{
+    Json::Value res;
+
+    auto computeTotalAndMaybeFillJson = [&](Json::Value& res, uint64 slot) {
+        auto tracked = getCostPerValidator(slot);
+        size_t total = 0;
+        for (auto const& t : tracked)
+        {
+            if (!summary)
+            {
+                res[std::to_string(slot)]
+                   [mApp.getConfig().toStrKey(t.first, fullKeys)] =
+                       static_cast<Json::UInt64>(t.second);
+            }
+            total += t.second;
+        }
+        return total;
+    };
+
+    // Total for one or all slots
+    size_t summaryTotal = 0;
+    if (index == 0)
+    {
+        for (auto const& s : mEnvelopes)
+        {
+            auto slotTotal = computeTotalAndMaybeFillJson(res, s.first);
+            summaryTotal += slotTotal;
+        }
+    }
+    else
+    {
+        summaryTotal = computeTotalAndMaybeFillJson(res, index);
+    }
+
+    if (summary)
+    {
+        res = static_cast<Json::UInt64>(summaryTotal);
+    }
+    return res;
 }
 }

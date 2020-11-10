@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "history/HistoryArchive.h"
 #include "work/Work.h"
 
 namespace medida
@@ -15,35 +16,51 @@ namespace stellar
 {
 
 class HistoryArchive;
-struct HistoryArchiveState;
+class GetRemoteFileWork;
 
 class GetHistoryArchiveStateWork : public Work
 {
-    HistoryArchiveState& mState;
+    std::shared_ptr<GetRemoteFileWork> mGetRemoteFile;
+
+    HistoryArchiveState mState;
     uint32_t mSeq;
-    VirtualClock::duration mInitialDelay;
-    std::shared_ptr<HistoryArchive const> mArchive;
+    std::shared_ptr<HistoryArchive> mArchive;
+    size_t mRetries;
     std::string mLocalFilename;
 
-    medida::Meter& mGetHistoryArchiveStateStart;
     medida::Meter& mGetHistoryArchiveStateSuccess;
-    medida::Meter& mGetHistoryArchiveStateFailure;
+
+    std::string getRemoteName() const;
 
   public:
     GetHistoryArchiveStateWork(
-        Application& app, WorkParent& parent, std::string uniqueName,
-        HistoryArchiveState& state, uint32_t seq = 0,
-        VirtualClock::duration const& intitialDelay = std::chrono::seconds(0),
-        std::shared_ptr<HistoryArchive const> archive = nullptr,
-        size_t maxRetries = Work::RETRY_A_FEW);
-    ~GetHistoryArchiveStateWork();
-    std::string getStatus() const override;
-    VirtualClock::duration getRetryDelay() const override;
-    void onReset() override;
-    void onRun() override;
+        Application& app, uint32_t seq = 0,
+        std::shared_ptr<HistoryArchive> archive = nullptr,
+        std::string mode = "", size_t maxRetries = BasicWork::RETRY_A_FEW);
+    ~GetHistoryArchiveStateWork() = default;
 
-    State onSuccess() override;
-    void onFailureRetry() override;
-    void onFailureRaise() override;
+    HistoryArchiveState const&
+    getHistoryArchiveState() const
+    {
+        if (getState() != State::WORK_SUCCESS)
+        {
+            throw std::runtime_error("GetHistoryArchiveStateWork must succeed "
+                                     "before state retrieval");
+        }
+        return mState;
+    }
+
+    std::shared_ptr<HistoryArchive>
+    getArchive() const
+    {
+        return mArchive;
+    }
+
+    std::string getStatus() const override;
+
+  protected:
+    BasicWork::State doWork() override;
+    void doReset() override;
+    void onSuccess() override;
 };
 }

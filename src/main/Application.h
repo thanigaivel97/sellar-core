@@ -5,6 +5,8 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "main/Config.h"
+#include "util/optional.h"
+#include "xdr/Stellar-ledger-entries.h"
 #include "xdr/Stellar-types.h"
 #include <lib/json/json.h>
 #include <memory>
@@ -12,7 +14,6 @@
 
 namespace asio
 {
-class io_service;
 }
 namespace medida
 {
@@ -27,7 +28,9 @@ class TmpDirManager;
 class LedgerManager;
 class BucketManager;
 class CatchupManager;
+class HistoryArchiveManager;
 class HistoryManager;
+class Maintainer;
 class ProcessManager;
 class Herder;
 class HerderPersistence;
@@ -35,11 +38,15 @@ class InvariantManager;
 class OverlayManager;
 class Database;
 class PersistentState;
-class LoadGenerator;
 class CommandHandler;
-class WorkManager;
+class WorkScheduler;
 class BanManager;
 class StatusManager;
+class AbstractLedgerTxnParent;
+
+#ifdef BUILD_TESTS
+class LoadGenerator;
+#endif
 
 class Application;
 void validateNetworkPassphrase(std::shared_ptr<Application> app);
@@ -74,7 +81,7 @@ void validateNetworkPassphrase(std::shared_ptr<Application> app);
  * configuration variables, including cryptographic keys, network ports, log
  * files, directories and the like. A local copy of the Config object is made on
  * construction of each Application, after which the local copy cannot be
- * further altered; the Application should be destroyed and recreted if any
+ * further altered; the Application should be destroyed and recreated if any
  * change to configuration is desired.
  *
  *
@@ -102,10 +109,10 @@ void validateNetworkPassphrase(std::shared_ptr<Application> app);
  * In general, Application expects to run on a single thread -- the main thread
  * -- and most subsystems perform no locking, are not multi-thread
  * safe. Operations with high IO latency are broken into steps and executed
- * piecewise through the VirtualClock's asio::io_service; those with high CPU
+ * piecewise through the VirtualClock's asio::io_context; those with high CPU
  * latency are run on a "worker" thread pool.
  *
- * Each Application owns a secondary "worker" asio::io_service, that queues and
+ * Each Application owns a secondary "worker" asio::io_context, that queues and
  * dispatches CPU-bound work to a number of worker threads (one per core); these
  * serve only to offload self-contained CPU-bound tasks like hashing from the
  * main thread, and do not generally call back into the Application's owned
@@ -113,9 +120,10 @@ void validateNetworkPassphrase(std::shared_ptr<Application> app);
  * objects).
  *
  * Completed "worker" tasks typically post their results back to the main
- * thread's io_service (held in the VirtualClock), or else deliver their results
+ * thread's io_context (held in the VirtualClock), or else deliver their results
  * to the Application through std::futures or similar standard
  * thread-synchronization primitives.
+ *
  */
 
 class Application
@@ -127,8 +135,8 @@ class Application
     // certain subsystem responses to IO events, timers etc.
     enum State
     {
-        // Loading state from database, not yet active. SCP is inhibited.
-        APP_BOOTING_STATE,
+        // Application created, but not started
+        APP_CREATED_STATE,
 
         // Out of sync with SCP peers
         APP_ACQUIRING_CONSENSUS_STATE,
@@ -154,7 +162,7 @@ class Application
 
     virtual ~Application(){};
 
-    virtual void initialize() = 0;
+    virtual void initialize(bool createNewDB) = 0;
 
     // Return the time in seconds since the POSIX epoch, according to the
     // VirtualClock this Application is bound to. Convenience method.
@@ -184,12 +192,17 @@ class Application
     // Call syncOwnMetrics on self and syncMetrics all objects owned by App.
     virtual void syncAllMetrics() = 0;
 
+    // Clear all metrics
+    virtual void clearMetrics(std::string const& domain) = 0;
+
     // Get references to each of the "subsystem" objects.
     virtual TmpDirManager& getTmpDirManager() = 0;
     virtual LedgerManager& getLedgerManager() = 0;
     virtual BucketManager& getBucketManager() = 0;
     virtual CatchupManager& getCatchupManager() = 0;
+    virtual HistoryArchiveManager& getHistoryArchiveManager() = 0;
     virtual HistoryManager& getHistoryManager() = 0;
+    virtual Maintainer& getMaintainer() = 0;
     virtual ProcessManager& getProcessManager() = 0;
     virtual Herder& getHerder() = 0;
     virtual HerderPersistence& getHerderPersistence() = 0;
@@ -198,14 +211,20 @@ class Application
     virtual Database& getDatabase() const = 0;
     virtual PersistentState& getPersistentState() = 0;
     virtual CommandHandler& getCommandHandler() = 0;
-    virtual WorkManager& getWorkManager() = 0;
+    virtual WorkScheduler& getWorkScheduler() = 0;
     virtual BanManager& getBanManager() = 0;
     virtual StatusManager& getStatusManager() = 0;
 
     // Get the worker IO service, served by background threads. Work posted to
-    // this io_service will execute in parallel with the calling thread, so use
+    // this io_context will execute in parallel with the calling thread, so use
     // with caution.
-    virtual asio::io_service& getWorkerIOService() = 0;
+    virtual asio::io_context& getWorkerIOContext() = 0;
+
+    virtual void postOnMainThread(
+        std::function<void()>&& f, std::string&& name,
+        Scheduler::ActionType type = Scheduler::ActionType::NORMAL_ACTION) = 0;
+    virtual void postOnBackgroundThread(std::function<void()>&& f,
+                                        std::string jobName) = 0;
 
     // Perform actions necessary to transition from BOOTING_STATE to other
     // states. In particular: either reload or reinitialize the database, and
@@ -213,33 +232,37 @@ class Application
     // Config).
     virtual void start() = 0;
 
-    // Stop the io_services, which should cause the threads to exit once they
+    // Stop the io_contexts, which should cause the threads to exit once they
     // finish running any work-in-progress.
     virtual void gracefulStop() = 0;
 
     // Wait-on and join all the threads this application started; should only
     // return when there is no more work to do or someone has force-stopped the
-    // worker io_service. Application can be safely destroyed after this
+    // worker io_context. Application can be safely destroyed after this
     // returns.
     virtual void joinAllThreads() = 0;
 
-    // If config.MANUAL_MODE=true, force the current ledger to close and return
+    // If config.MANUAL_CLOSE=true, force the current ledger to close and return
     // true. Otherwise return false. This method exists only for testing.
-    virtual bool manualClose() = 0;
+    //
+    // Non-default parameters may be specified only if additionally
+    // config.RUN_STANDALONE=true.
+    virtual std::string
+    manualClose(optional<uint32_t> const& manualLedgerSeq,
+                optional<TimePoint> const& manualCloseTime) = 0;
 
+#ifdef BUILD_TESTS
     // If config.ARTIFICIALLY_GENERATE_LOAD_FOR_TESTING=true, generate some load
     // against the current application.
-    virtual void generateLoad(uint32_t nAccounts, uint32_t nTxs,
-                              uint32_t txRate, bool autoRate) = 0;
+    virtual void generateLoad(bool isCreate, uint32_t nAccounts,
+                              uint32_t offset, uint32_t nTxs, uint32_t txRate,
+                              uint32_t batchSize,
+                              std::chrono::seconds spikeInterval,
+                              uint32_t spikeSize) = 0;
 
     // Access the load generator for manual operation.
     virtual LoadGenerator& getLoadGenerator() = 0;
-
-    // Run a consistency check between the database and the bucketlist.
-    virtual void checkDB() = 0;
-
-    // perform maintenance tasks
-    virtual void maintenance() = 0;
+#endif
 
     // Execute any administrative commands written in the Config.COMMANDS
     // variable of the config file. This permits scripting certain actions to
@@ -260,20 +283,19 @@ class Application
     // instances
     virtual Hash const& getNetworkID() const = 0;
 
-    virtual void newDB() = 0;
+    virtual AbstractLedgerTxnParent& getLedgerTxnRoot() = 0;
 
     // Factory: create a new Application object bound to `clock`, with a local
-    // copy made of `cfg`.
+    // copy made of `cfg`
     static pointer create(VirtualClock& clock, Config const& cfg,
                           bool newDB = true);
-    template <typename T>
+    template <typename T, typename... Args>
     static std::shared_ptr<T>
-    create(VirtualClock& clock, Config const& cfg, bool newDB = true)
+    create(VirtualClock& clock, Config const& cfg, Args&&... args,
+           bool newDB = true)
     {
-        auto ret = std::make_shared<T>(clock, cfg);
-        ret->initialize();
-        if (newDB || cfg.DATABASE.value == "sqlite3://:memory:")
-            ret->newDB();
+        auto ret = std::make_shared<T>(clock, cfg, std::forward<Args>(args)...);
+        ret->initialize(newDB);
         validateNetworkPassphrase(ret);
 
         return ret;

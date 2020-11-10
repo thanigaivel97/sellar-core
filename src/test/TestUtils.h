@@ -18,11 +18,13 @@ class LoopbackPeerConnection;
 
 namespace testutil
 {
-void setCurrentLedgerVersion(LedgerManager& lm, uint32_t currentLedgerVersion);
 void crankSome(VirtualClock& clock);
+void crankFor(VirtualClock& clock, VirtualClock::duration duration);
 void injectSendPeersAndReschedule(VirtualClock::time_point& end,
                                   VirtualClock& clock, VirtualTimer& timer,
                                   LoopbackPeerConnection& connection);
+
+void shutdownWorkScheduler(Application& app);
 
 class BucketListDepthModifier
 {
@@ -33,6 +35,14 @@ class BucketListDepthModifier
 
     ~BucketListDepthModifier();
 };
+
+inline BucketMetadata
+testBucketMetadata(uint32_t protocolVersion)
+{
+    BucketMetadata meta;
+    meta.ledgerVersion = protocolVersion;
+    return meta;
+}
 }
 
 class TestInvariantManager : public InvariantManagerImpl
@@ -55,15 +65,17 @@ class TestApplication : public ApplicationImpl
     std::unique_ptr<InvariantManager> createInvariantManager() override;
 };
 
-template <typename T = TestApplication,
+template <typename T = TestApplication, typename... Args,
           typename = typename std::enable_if<
               std::is_base_of<TestApplication, T>::value>::type>
 std::shared_ptr<T>
-createTestApplication(VirtualClock& clock, Config const& cfg)
+createTestApplication(VirtualClock& clock, Config const& cfg, Args&&... args,
+                      bool newDB = true)
 {
     Config c2(cfg);
-    c2.USE_CONFIG_FOR_GENESIS = true;
-    auto app = Application::create<T>(clock, c2);
+    c2.adjust();
+    auto app = Application::create<T, Args...>(
+        clock, c2, std::forward<Args>(args)..., newDB);
     return app;
 }
 
@@ -71,5 +83,5 @@ time_t getTestDate(int day, int month, int year);
 std::tm getTestDateTime(int day, int month, int year, int hour, int minute,
                         int second);
 
-VirtualClock::time_point genesis(int minute, int second);
+VirtualClock::system_time_point genesis(int minute, int second);
 }

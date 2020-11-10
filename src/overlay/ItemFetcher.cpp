@@ -14,21 +14,20 @@
 #include "overlay/Tracker.h"
 #include "util/Logging.h"
 #include "xdrpp/marshal.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
 
 ItemFetcher::ItemFetcher(Application& app, AskPeer askPeer)
-    : mApp(app)
-    , mItemMapSize(
-          app.getMetrics().NewCounter({"overlay", "memory", "item-fetch-map"}))
-    , mAskPeer(askPeer)
+    : mApp(app), mAskPeer(askPeer)
 {
 }
 
 void
-ItemFetcher::fetch(Hash itemHash, const SCPEnvelope& envelope)
+ItemFetcher::fetch(Hash const& itemHash, const SCPEnvelope& envelope)
 {
+    ZoneScoped;
     CLOG(TRACE, "Overlay") << "fetch " << hexAbbrev(itemHash);
     auto entryIt = mTrackers.find(itemHash);
     if (entryIt == mTrackers.end())
@@ -36,7 +35,6 @@ ItemFetcher::fetch(Hash itemHash, const SCPEnvelope& envelope)
         TrackerPtr tracker =
             std::make_shared<Tracker>(mApp, itemHash, mAskPeer);
         mTrackers[itemHash] = tracker;
-        mItemMapSize.inc();
 
         tracker->listen(envelope);
         tracker->tryNextPeer();
@@ -48,9 +46,9 @@ ItemFetcher::fetch(Hash itemHash, const SCPEnvelope& envelope)
 }
 
 void
-ItemFetcher::stopFetch(Hash itemHash, const SCPEnvelope& envelope)
+ItemFetcher::stopFetch(Hash const& itemHash, SCPEnvelope const& envelope)
 {
-    CLOG(TRACE, "Overlay") << "stopFetch " << hexAbbrev(itemHash);
+    ZoneScoped;
     const auto& iter = mTrackers.find(itemHash);
     if (iter != mTrackers.end())
     {
@@ -66,10 +64,14 @@ ItemFetcher::stopFetch(Hash itemHash, const SCPEnvelope& envelope)
             tracker->cancel();
         }
     }
+    else
+    {
+        CLOG(TRACE, "Overlay") << "stopFetch untracked " << hexAbbrev(itemHash);
+    }
 }
 
 uint64
-ItemFetcher::getLastSeenSlotIndex(Hash itemHash) const
+ItemFetcher::getLastSeenSlotIndex(Hash const& itemHash) const
 {
     auto iter = mTrackers.find(itemHash);
     if (iter == mTrackers.end())
@@ -81,7 +83,7 @@ ItemFetcher::getLastSeenSlotIndex(Hash itemHash) const
 }
 
 std::vector<SCPEnvelope>
-ItemFetcher::fetchingFor(Hash itemHash) const
+ItemFetcher::fetchingFor(Hash const& itemHash) const
 {
     auto result = std::vector<SCPEnvelope>{};
     auto iter = mTrackers.find(itemHash);
@@ -102,19 +104,20 @@ ItemFetcher::stopFetchingBelow(uint64 slotIndex)
 {
     // only perform this cleanup from the top of the stack as it causes
     // all sorts of evil side effects
-    mApp.getClock().getIOService().post(
-        [this, slotIndex]() { stopFetchingBelowInternal(slotIndex); });
+    mApp.postOnMainThread(
+        [this, slotIndex]() { stopFetchingBelowInternal(slotIndex); },
+        "ItemFetcher: stopFetchingBelow");
 }
 
 void
 ItemFetcher::stopFetchingBelowInternal(uint64 slotIndex)
 {
+    ZoneScoped;
     for (auto iter = mTrackers.begin(); iter != mTrackers.end();)
     {
         if (!iter->second->clearEnvelopesBelow(slotIndex))
         {
             iter = mTrackers.erase(iter);
-            mItemMapSize.dec();
         }
         else
         {
@@ -126,6 +129,7 @@ ItemFetcher::stopFetchingBelowInternal(uint64 slotIndex)
 void
 ItemFetcher::doesntHave(Hash const& itemHash, Peer::pointer peer)
 {
+    ZoneScoped;
     const auto& iter = mTrackers.find(itemHash);
     if (iter != mTrackers.end())
     {
@@ -134,9 +138,9 @@ ItemFetcher::doesntHave(Hash const& itemHash, Peer::pointer peer)
 }
 
 void
-ItemFetcher::recv(Hash itemHash)
+ItemFetcher::recv(Hash itemHash, medida::Timer& timer)
 {
-    CLOG(TRACE, "Overlay") << "Recv " << hexAbbrev(itemHash);
+    ZoneScoped;
     const auto& iter = mTrackers.find(itemHash);
 
     if (iter != mTrackers.end())
@@ -148,6 +152,7 @@ ItemFetcher::recv(Hash itemHash)
         CLOG(TRACE, "Overlay")
             << "Recv " << hexAbbrev(itemHash) << " : " << tracker->size();
 
+        timer.Update(tracker->getDuration());
         while (!tracker->empty())
         {
             mApp.getHerder().recvSCPEnvelope(tracker->pop());
@@ -156,5 +161,22 @@ ItemFetcher::recv(Hash itemHash)
         tracker->resetLastSeenSlotIndex();
         tracker->cancel();
     }
+    else
+    {
+        CLOG(TRACE, "Overlay") << "Recv untracked " << hexAbbrev(itemHash);
+    }
 }
+
+#ifdef BUILD_TESTS
+std::shared_ptr<Tracker>
+ItemFetcher::getTracker(Hash const& h)
+{
+    auto it = mTrackers.find(h);
+    if (it == mTrackers.end())
+    {
+        return nullptr;
+    }
+    return it->second;
+}
+#endif
 }

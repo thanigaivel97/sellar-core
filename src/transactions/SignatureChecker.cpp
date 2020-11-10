@@ -10,12 +10,11 @@
 #include "crypto/SignerKey.h"
 #include "transactions/SignatureUtils.h"
 #include "util/Algoritm.h"
+#include "util/XDROperators.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
-
-using xdr::operator<;
-using xdr::operator==;
 
 SignatureChecker::SignatureChecker(
     uint32_t protocolVersion, Hash const& contentsHash,
@@ -32,6 +31,10 @@ SignatureChecker::checkSignature(AccountID const& accountID,
                                  std::vector<Signer> const& signersV,
                                  int neededWeight)
 {
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    return true;
+#endif // FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+
     if (mProtocolVersion == 7)
     {
         return true;
@@ -52,8 +55,12 @@ SignatureChecker::checkSignature(AccountID const& accountID,
     {
         if (signerKey.key.preAuthTx() == mContentsHash)
         {
-            mUsedOneTimeSignerKeys[accountID].insert(signerKey.key);
-            totalWeight += signerKey.weight;
+            auto w = signerKey.weight;
+            if (mProtocolVersion > 9 && w > UINT8_MAX)
+            {
+                w = UINT8_MAX;
+            }
+            totalWeight += w;
             if (totalWeight >= neededWeight)
                 return true;
         }
@@ -72,7 +79,12 @@ SignatureChecker::checkSignature(AccountID const& accountID,
                 if (verify(sig, signerKey))
                 {
                     mUsedSignatures[i] = true;
-                    totalWeight += signerKey.weight;
+                    auto w = signerKey.weight;
+                    if (mProtocolVersion > 9 && w > UINT8_MAX)
+                    {
+                        w = UINT8_MAX;
+                    }
+                    totalWeight += w;
                     if (totalWeight >= neededWeight)
                         return true;
 
@@ -111,6 +123,10 @@ SignatureChecker::checkSignature(AccountID const& accountID,
 bool
 SignatureChecker::checkAllSignaturesUsed() const
 {
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+    return true;
+#endif // FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+
     if (mProtocolVersion == 7)
     {
         return true;
@@ -124,11 +140,5 @@ SignatureChecker::checkAllSignaturesUsed() const
         }
     }
     return true;
-}
-
-const UsedOneTimeSignerKeys&
-SignatureChecker::usedOneTimeSignerKeys() const
-{
-    return mUsedOneTimeSignerKeys;
 }
 };

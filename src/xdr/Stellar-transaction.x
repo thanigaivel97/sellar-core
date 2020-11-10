@@ -7,6 +7,19 @@
 namespace stellar
 {
 
+// Source or destination of a payment operation
+union MuxedAccount switch (CryptoKeyType type)
+{
+case KEY_TYPE_ED25519:
+    uint256 ed25519;
+case KEY_TYPE_MUXED_ED25519:
+    struct
+    {
+        uint64 id;
+        uint256 ed25519;
+    } med25519;
+};
+
 struct DecoratedSignature
 {
     SignatureHint hint;  // last 4 bytes of the public key, used as a hint
@@ -17,15 +30,23 @@ enum OperationType
 {
     CREATE_ACCOUNT = 0,
     PAYMENT = 1,
-    PATH_PAYMENT = 2,
-    MANAGE_OFFER = 3,
-    CREATE_PASSIVE_OFFER = 4,
+    PATH_PAYMENT_STRICT_RECEIVE = 2,
+    MANAGE_SELL_OFFER = 3,
+    CREATE_PASSIVE_SELL_OFFER = 4,
     SET_OPTIONS = 5,
     CHANGE_TRUST = 6,
     ALLOW_TRUST = 7,
     ACCOUNT_MERGE = 8,
     INFLATION = 9,
-    MANAGE_DATA = 10
+    MANAGE_DATA = 10,
+    BUMP_SEQUENCE = 11,
+    MANAGE_BUY_OFFER = 12,
+    PATH_PAYMENT_STRICT_SEND = 13,
+    CREATE_CLAIMABLE_BALANCE = 14,
+    CLAIM_CLAIMABLE_BALANCE = 15,
+    BEGIN_SPONSORING_FUTURE_RESERVES = 16,
+    END_SPONSORING_FUTURE_RESERVES = 17,
+    REVOKE_SPONSORSHIP = 18
 };
 
 /* CreateAccount
@@ -36,7 +57,6 @@ Threshold: med
 Result: CreateAccountResult
 
 */
-
 struct CreateAccountOp
 {
     AccountID destination; // account to create
@@ -53,12 +73,12 @@ struct CreateAccountOp
 */
 struct PaymentOp
 {
-    AccountID destination; // recipient of the payment
-    Asset asset;           // what they end up with
-    int64 amount;          // amount they end up with
+    MuxedAccount destination; // recipient of the payment
+    Asset asset;              // what they end up with
+    int64 amount;             // amount they end up with
 };
 
-/* PathPayment
+/* PathPaymentStrictReceive
 
 send an amount to a destination account through a path.
 (up to sendMax, sendAsset)
@@ -67,18 +87,43 @@ send an amount to a destination account through a path.
 
 Threshold: med
 
-Result: PathPaymentResult
+Result: PathPaymentStrictReceiveResult
 */
-struct PathPaymentOp
+struct PathPaymentStrictReceiveOp
 {
     Asset sendAsset; // asset we pay with
     int64 sendMax;   // the maximum amount of sendAsset to
                      // send (excluding fees).
                      // The operation will fail if can't be met
 
-    AccountID destination; // recipient of the payment
-    Asset destAsset;       // what they end up with
-    int64 destAmount;      // amount they end up with
+    MuxedAccount destination; // recipient of the payment
+    Asset destAsset;          // what they end up with
+    int64 destAmount;         // amount they end up with
+
+    Asset path<5>; // additional hops it must go through to get there
+};
+
+/* PathPaymentStrictSend
+
+send an amount to a destination account through a path.
+(sendMax, sendAsset)
+(X0, Path[0]) .. (Xn, Path[n])
+(at least destAmount, destAsset)
+
+Threshold: med
+
+Result: PathPaymentStrictSendResult
+*/
+struct PathPaymentStrictSendOp
+{
+    Asset sendAsset;  // asset we pay with
+    int64 sendAmount; // amount of sendAsset to send (excluding fees)
+
+    MuxedAccount destination; // recipient of the payment
+    Asset destAsset;          // what they end up with
+    int64 destMin;            // the minimum amount of dest asset to
+                              // be received
+                              // The operation will fail if it can't be met
 
     Asset path<5>; // additional hops it must go through to get there
 };
@@ -87,10 +132,10 @@ struct PathPaymentOp
 
 Threshold: med
 
-Result: ManageOfferResult
+Result: ManageSellOfferResult
 
 */
-struct ManageOfferOp
+struct ManageSellOfferOp
 {
     Asset selling;
     Asset buying;
@@ -98,17 +143,36 @@ struct ManageOfferOp
     Price price;  // price of thing being sold in terms of what you are buying
 
     // 0=create a new offer, otherwise edit an existing offer
-    uint64 offerID;
+    int64 offerID;
+};
+
+/* Creates, updates or deletes an offer with amount in terms of buying asset
+
+Threshold: med
+
+Result: ManageBuyOfferResult
+
+*/
+struct ManageBuyOfferOp
+{
+    Asset selling;
+    Asset buying;
+    int64 buyAmount; // amount being bought. if set to 0, delete the offer
+    Price price;     // price of thing being bought in terms of what you are
+                     // selling
+
+    // 0=create a new offer, otherwise edit an existing offer
+    int64 offerID;
 };
 
 /* Creates an offer that doesn't take offers of the same price
 
 Threshold: med
 
-Result: CreatePassiveOfferResult
+Result: CreatePassiveSellOfferResult
 
 */
-struct CreatePassiveOfferOp
+struct CreatePassiveSellOfferOp
 {
     Asset selling; // A
     Asset buying;  // B
@@ -125,7 +189,6 @@ struct CreatePassiveOfferOp
 
     Result: SetOptionsResult
 */
-
 struct SetOptionsOp
 {
     AccountID* inflationDest; // sets the inflation destination
@@ -177,16 +240,17 @@ struct AllowTrustOp
     {
     // ASSET_TYPE_NATIVE is not allowed
     case ASSET_TYPE_CREDIT_ALPHANUM4:
-        opaque assetCode4[4];
+        AssetCode4 assetCode4;
 
     case ASSET_TYPE_CREDIT_ALPHANUM12:
-        opaque assetCode12[12];
+        AssetCode12 assetCode12;
 
         // add other asset types here in the future
     }
     asset;
 
-    bool authorize;
+    // 0, or any bitwise combination of TrustLineFlags
+    uint32 authorize;
 };
 
 /* Inflation
@@ -207,18 +271,109 @@ Result: InflationResult
 */
 
 /* ManageData
-    Adds, Updates, or Deletes a key value pair associated with a particular 
-	account.
+    Adds, Updates, or Deletes a key value pair associated with a particular
+        account.
 
     Threshold: med
 
     Result: ManageDataResult
 */
-
 struct ManageDataOp
 {
-    string64 dataName; 
-    DataValue* dataValue;   // set to null to clear
+    string64 dataName;
+    DataValue* dataValue; // set to null to clear
+};
+
+/* Bump Sequence
+
+    increases the sequence to a given level
+
+    Threshold: low
+
+    Result: BumpSequenceResult
+*/
+struct BumpSequenceOp
+{
+    SequenceNumber bumpTo;
+};
+
+/* Creates a claimable balance entry
+
+    Threshold: med
+
+    Result: CreateClaimableBalanceResult
+*/
+struct CreateClaimableBalanceOp
+{
+    Asset asset;
+    int64 amount;
+    Claimant claimants<10>;
+};
+
+/* Claims a claimable balance entry
+
+    Threshold: low
+
+    Result: ClaimClaimableBalanceResult
+*/
+struct ClaimClaimableBalanceOp
+{
+    ClaimableBalanceID balanceID;
+};
+
+/* BeginSponsoringFutureReserves
+
+    Establishes the is-sponsoring-future-reserves-for relationship between
+    the source account and sponsoredID
+
+    Threshold: med
+
+    Result: BeginSponsoringFutureReservesResult
+*/
+struct BeginSponsoringFutureReservesOp
+{
+    AccountID sponsoredID;
+};
+
+/* EndSponsoringFutureReserves
+
+    Terminates the current is-sponsoring-future-reserves-for relationship in
+    which source account is sponsored
+
+    Threshold: med
+
+    Result: EndSponsoringFutureReservesResult
+*/
+// EndSponsoringFutureReserves is empty
+
+/* RevokeSponsorship
+
+    If source account is not sponsored or is sponsored by the owner of the
+    specified entry or sub-entry, then attempt to revoke the sponsorship.
+    If source account is sponsored, then attempt to transfer the sponsorship
+    to the sponsor of source account.
+
+    Threshold: med
+
+    Result: RevokeSponsorshipResult
+*/
+enum RevokeSponsorshipType
+{
+    REVOKE_SPONSORSHIP_LEDGER_ENTRY = 0,
+    REVOKE_SPONSORSHIP_SIGNER = 1
+};
+
+union RevokeSponsorshipOp switch (RevokeSponsorshipType type)
+{
+case REVOKE_SPONSORSHIP_LEDGER_ENTRY:
+    LedgerKey ledgerKey;
+case REVOKE_SPONSORSHIP_SIGNER:
+    struct
+    {
+        AccountID accountID;
+        SignerKey signerKey;
+    }
+    signer;
 };
 
 /* An operation is the lowest unit of work that a transaction does */
@@ -227,7 +382,7 @@ struct Operation
     // sourceAccount is the account used to run the operation
     // if not set, the runtime defaults to "sourceAccount" specified at
     // the transaction level
-    AccountID* sourceAccount;
+    MuxedAccount* sourceAccount;
 
     union switch (OperationType type)
     {
@@ -235,12 +390,12 @@ struct Operation
         CreateAccountOp createAccountOp;
     case PAYMENT:
         PaymentOp paymentOp;
-    case PATH_PAYMENT:
-        PathPaymentOp pathPaymentOp;
-    case MANAGE_OFFER:
-        ManageOfferOp manageOfferOp;
-    case CREATE_PASSIVE_OFFER:
-        CreatePassiveOfferOp createPassiveOfferOp;
+    case PATH_PAYMENT_STRICT_RECEIVE:
+        PathPaymentStrictReceiveOp pathPaymentStrictReceiveOp;
+    case MANAGE_SELL_OFFER:
+        ManageSellOfferOp manageSellOfferOp;
+    case CREATE_PASSIVE_SELL_OFFER:
+        CreatePassiveSellOfferOp createPassiveSellOfferOp;
     case SET_OPTIONS:
         SetOptionsOp setOptionsOp;
     case CHANGE_TRUST:
@@ -248,13 +403,40 @@ struct Operation
     case ALLOW_TRUST:
         AllowTrustOp allowTrustOp;
     case ACCOUNT_MERGE:
-        AccountID destination;
+        MuxedAccount destination;
     case INFLATION:
         void;
     case MANAGE_DATA:
         ManageDataOp manageDataOp;
+    case BUMP_SEQUENCE:
+        BumpSequenceOp bumpSequenceOp;
+    case MANAGE_BUY_OFFER:
+        ManageBuyOfferOp manageBuyOfferOp;
+    case PATH_PAYMENT_STRICT_SEND:
+        PathPaymentStrictSendOp pathPaymentStrictSendOp;
+    case CREATE_CLAIMABLE_BALANCE:
+        CreateClaimableBalanceOp createClaimableBalanceOp;
+    case CLAIM_CLAIMABLE_BALANCE:
+        ClaimClaimableBalanceOp claimClaimableBalanceOp;
+    case BEGIN_SPONSORING_FUTURE_RESERVES:
+        BeginSponsoringFutureReservesOp beginSponsoringFutureReservesOp;
+    case END_SPONSORING_FUTURE_RESERVES:
+        void;
+    case REVOKE_SPONSORSHIP:
+        RevokeSponsorshipOp revokeSponsorshipOp;
     }
     body;
+};
+
+union OperationID switch (EnvelopeType type)
+{
+case ENVELOPE_TYPE_OP_ID:
+    struct
+    {
+        MuxedAccount sourceAccount;
+        SequenceNumber seqNum;
+        uint32 opNum;
+    } id;
 };
 
 enum MemoType
@@ -282,8 +464,41 @@ case MEMO_RETURN:
 
 struct TimeBounds
 {
-    uint64 minTime;
-    uint64 maxTime; // 0 here means no maxTime
+    TimePoint minTime;
+    TimePoint maxTime; // 0 here means no maxTime
+};
+
+// maximum number of operations per transaction
+const MAX_OPS_PER_TX = 100;
+
+// TransactionV0 is a transaction with the AccountID discriminant stripped off,
+// leaving a raw ed25519 public key to identify the source account. This is used
+// for backwards compatibility starting from the protocol 12/13 boundary. If an
+// "old-style" TransactionEnvelope containing a Transaction is parsed with this
+// XDR definition, it will be parsed as a "new-style" TransactionEnvelope
+// containing a TransactionV0.
+struct TransactionV0
+{
+    uint256 sourceAccountEd25519;
+    uint32 fee;
+    SequenceNumber seqNum;
+    TimeBounds* timeBounds;
+    Memo memo;
+    Operation operations<MAX_OPS_PER_TX>;
+    union switch (int v)
+    {
+    case 0:
+        void;
+    }
+    ext;
+};
+
+struct TransactionV0Envelope
+{
+    TransactionV0 tx;
+    /* Each decorated signature is a signature over the SHA256 hash of
+     * a TransactionSignaturePayload */
+    DecoratedSignature signatures<20>;
 };
 
 /* a transaction is a container for a set of operations
@@ -293,11 +508,10 @@ struct TimeBounds
           either all operations are applied or none are
           if any returns a failing code
 */
-
 struct Transaction
 {
     // account used to run the transaction
-    AccountID sourceAccount;
+    MuxedAccount sourceAccount;
 
     // the fee the sourceAccount will pay
     uint32 fee;
@@ -310,7 +524,7 @@ struct Transaction
 
     Memo memo;
 
-    Operation operations<100>;
+    Operation operations<MAX_OPS_PER_TX>;
 
     // reserved for future use
     union switch (int v)
@@ -321,24 +535,63 @@ struct Transaction
     ext;
 };
 
-struct TransactionSignaturePayload {
-    Hash networkId;
-    union switch (EnvelopeType type)
-    {
-    case ENVELOPE_TYPE_TX:
-          Transaction tx;
-    /* All other values of type are invalid */
-    } taggedTransaction;
-};
-
-/* A TransactionEnvelope wraps a transaction with signatures. */
-struct TransactionEnvelope
+struct TransactionV1Envelope
 {
     Transaction tx;
     /* Each decorated signature is a signature over the SHA256 hash of
      * a TransactionSignaturePayload */
-    DecoratedSignature
-    signatures<20>;
+    DecoratedSignature signatures<20>;
+};
+
+struct FeeBumpTransaction
+{
+    MuxedAccount feeSource;
+    int64 fee;
+    union switch (EnvelopeType type)
+    {
+    case ENVELOPE_TYPE_TX:
+        TransactionV1Envelope v1;
+    }
+    innerTx;
+    union switch (int v)
+    {
+    case 0:
+        void;
+    }
+    ext;
+};
+
+struct FeeBumpTransactionEnvelope
+{
+    FeeBumpTransaction tx;
+    /* Each decorated signature is a signature over the SHA256 hash of
+     * a TransactionSignaturePayload */
+    DecoratedSignature signatures<20>;
+};
+
+/* A TransactionEnvelope wraps a transaction with signatures. */
+union TransactionEnvelope switch (EnvelopeType type)
+{
+case ENVELOPE_TYPE_TX_V0:
+    TransactionV0Envelope v0;
+case ENVELOPE_TYPE_TX:
+    TransactionV1Envelope v1;
+case ENVELOPE_TYPE_TX_FEE_BUMP:
+    FeeBumpTransactionEnvelope feeBump;
+};
+
+struct TransactionSignaturePayload
+{
+    Hash networkId;
+    union switch (EnvelopeType type)
+    {
+    // Backwards Compatibility: Use ENVELOPE_TYPE_TX to sign ENVELOPE_TYPE_TX_V0
+    case ENVELOPE_TYPE_TX:
+        Transaction tx;
+    case ENVELOPE_TYPE_TX_FEE_BUMP:
+        FeeBumpTransaction feeBump;
+    }
+    taggedTransaction;
 };
 
 /* Operation Results section */
@@ -348,7 +601,7 @@ struct ClaimOfferAtom
 {
     // emitted to identify the offer
     AccountID sellerID; // Account that owns the offer
-    uint64 offerID;
+    int64 offerID;
 
     // amount and asset taken from the owner
     Asset assetSold;
@@ -409,26 +662,35 @@ default:
     void;
 };
 
-/******* Payment Result ********/
+/******* PathPaymentStrictReceive Result ********/
 
-enum PathPaymentResultCode
+enum PathPaymentStrictReceiveResultCode
 {
     // codes considered as "success" for the operation
-    PATH_PAYMENT_SUCCESS = 0, // success
+    PATH_PAYMENT_STRICT_RECEIVE_SUCCESS = 0, // success
 
     // codes considered as "failure" for the operation
-    PATH_PAYMENT_MALFORMED = -1,          // bad input
-    PATH_PAYMENT_UNDERFUNDED = -2,        // not enough funds in source account
-    PATH_PAYMENT_SRC_NO_TRUST = -3,       // no trust line on source account
-    PATH_PAYMENT_SRC_NOT_AUTHORIZED = -4, // source not authorized to transfer
-    PATH_PAYMENT_NO_DESTINATION = -5,     // destination account does not exist
-    PATH_PAYMENT_NO_TRUST = -6,           // dest missing a trust line for asset
-    PATH_PAYMENT_NOT_AUTHORIZED = -7,     // dest not authorized to hold asset
-    PATH_PAYMENT_LINE_FULL = -8,          // dest would go above their limit
-    PATH_PAYMENT_NO_ISSUER = -9,          // missing issuer on one asset
-    PATH_PAYMENT_TOO_FEW_OFFERS = -10,    // not enough offers to satisfy path
-    PATH_PAYMENT_OFFER_CROSS_SELF = -11,  // would cross one of its own offers
-    PATH_PAYMENT_OVER_SENDMAX = -12       // could not satisfy sendmax
+    PATH_PAYMENT_STRICT_RECEIVE_MALFORMED = -1, // bad input
+    PATH_PAYMENT_STRICT_RECEIVE_UNDERFUNDED =
+        -2, // not enough funds in source account
+    PATH_PAYMENT_STRICT_RECEIVE_SRC_NO_TRUST =
+        -3, // no trust line on source account
+    PATH_PAYMENT_STRICT_RECEIVE_SRC_NOT_AUTHORIZED =
+        -4, // source not authorized to transfer
+    PATH_PAYMENT_STRICT_RECEIVE_NO_DESTINATION =
+        -5, // destination account does not exist
+    PATH_PAYMENT_STRICT_RECEIVE_NO_TRUST =
+        -6, // dest missing a trust line for asset
+    PATH_PAYMENT_STRICT_RECEIVE_NOT_AUTHORIZED =
+        -7, // dest not authorized to hold asset
+    PATH_PAYMENT_STRICT_RECEIVE_LINE_FULL =
+        -8, // dest would go above their limit
+    PATH_PAYMENT_STRICT_RECEIVE_NO_ISSUER = -9, // missing issuer on one asset
+    PATH_PAYMENT_STRICT_RECEIVE_TOO_FEW_OFFERS =
+        -10, // not enough offers to satisfy path
+    PATH_PAYMENT_STRICT_RECEIVE_OFFER_CROSS_SELF =
+        -11, // would cross one of its own offers
+    PATH_PAYMENT_STRICT_RECEIVE_OVER_SENDMAX = -12 // could not satisfy sendmax
 };
 
 struct SimplePaymentResult
@@ -438,43 +700,92 @@ struct SimplePaymentResult
     int64 amount;
 };
 
-union PathPaymentResult switch (PathPaymentResultCode code)
+union PathPaymentStrictReceiveResult switch (
+    PathPaymentStrictReceiveResultCode code)
 {
-case PATH_PAYMENT_SUCCESS:
+case PATH_PAYMENT_STRICT_RECEIVE_SUCCESS:
     struct
     {
         ClaimOfferAtom offers<>;
         SimplePaymentResult last;
     } success;
-case PATH_PAYMENT_NO_ISSUER:
+case PATH_PAYMENT_STRICT_RECEIVE_NO_ISSUER:
     Asset noIssuer; // the asset that caused the error
 default:
     void;
 };
 
-/******* ManageOffer Result ********/
+/******* PathPaymentStrictSend Result ********/
 
-enum ManageOfferResultCode
+enum PathPaymentStrictSendResultCode
 {
     // codes considered as "success" for the operation
-    MANAGE_OFFER_SUCCESS = 0,
+    PATH_PAYMENT_STRICT_SEND_SUCCESS = 0, // success
 
     // codes considered as "failure" for the operation
-    MANAGE_OFFER_MALFORMED = -1,     // generated offer would be invalid
-    MANAGE_OFFER_SELL_NO_TRUST = -2, // no trust line for what we're selling
-    MANAGE_OFFER_BUY_NO_TRUST = -3,  // no trust line for what we're buying
-    MANAGE_OFFER_SELL_NOT_AUTHORIZED = -4, // not authorized to sell
-    MANAGE_OFFER_BUY_NOT_AUTHORIZED = -5,  // not authorized to buy
-    MANAGE_OFFER_LINE_FULL = -6,      // can't receive more of what it's buying
-    MANAGE_OFFER_UNDERFUNDED = -7,    // doesn't hold what it's trying to sell
-    MANAGE_OFFER_CROSS_SELF = -8,     // would cross an offer from the same user
-    MANAGE_OFFER_SELL_NO_ISSUER = -9, // no issuer for what we're selling
-    MANAGE_OFFER_BUY_NO_ISSUER = -10, // no issuer for what we're buying
+    PATH_PAYMENT_STRICT_SEND_MALFORMED = -1, // bad input
+    PATH_PAYMENT_STRICT_SEND_UNDERFUNDED =
+        -2, // not enough funds in source account
+    PATH_PAYMENT_STRICT_SEND_SRC_NO_TRUST =
+        -3, // no trust line on source account
+    PATH_PAYMENT_STRICT_SEND_SRC_NOT_AUTHORIZED =
+        -4, // source not authorized to transfer
+    PATH_PAYMENT_STRICT_SEND_NO_DESTINATION =
+        -5, // destination account does not exist
+    PATH_PAYMENT_STRICT_SEND_NO_TRUST =
+        -6, // dest missing a trust line for asset
+    PATH_PAYMENT_STRICT_SEND_NOT_AUTHORIZED =
+        -7, // dest not authorized to hold asset
+    PATH_PAYMENT_STRICT_SEND_LINE_FULL = -8, // dest would go above their limit
+    PATH_PAYMENT_STRICT_SEND_NO_ISSUER = -9, // missing issuer on one asset
+    PATH_PAYMENT_STRICT_SEND_TOO_FEW_OFFERS =
+        -10, // not enough offers to satisfy path
+    PATH_PAYMENT_STRICT_SEND_OFFER_CROSS_SELF =
+        -11, // would cross one of its own offers
+    PATH_PAYMENT_STRICT_SEND_UNDER_DESTMIN = -12 // could not satisfy destMin
+};
+
+union PathPaymentStrictSendResult switch (PathPaymentStrictSendResultCode code)
+{
+case PATH_PAYMENT_STRICT_SEND_SUCCESS:
+    struct
+    {
+        ClaimOfferAtom offers<>;
+        SimplePaymentResult last;
+    } success;
+case PATH_PAYMENT_STRICT_SEND_NO_ISSUER:
+    Asset noIssuer; // the asset that caused the error
+default:
+    void;
+};
+
+/******* ManageSellOffer Result ********/
+
+enum ManageSellOfferResultCode
+{
+    // codes considered as "success" for the operation
+    MANAGE_SELL_OFFER_SUCCESS = 0,
+
+    // codes considered as "failure" for the operation
+    MANAGE_SELL_OFFER_MALFORMED = -1, // generated offer would be invalid
+    MANAGE_SELL_OFFER_SELL_NO_TRUST =
+        -2,                              // no trust line for what we're selling
+    MANAGE_SELL_OFFER_BUY_NO_TRUST = -3, // no trust line for what we're buying
+    MANAGE_SELL_OFFER_SELL_NOT_AUTHORIZED = -4, // not authorized to sell
+    MANAGE_SELL_OFFER_BUY_NOT_AUTHORIZED = -5,  // not authorized to buy
+    MANAGE_SELL_OFFER_LINE_FULL = -6, // can't receive more of what it's buying
+    MANAGE_SELL_OFFER_UNDERFUNDED = -7, // doesn't hold what it's trying to sell
+    MANAGE_SELL_OFFER_CROSS_SELF =
+        -8, // would cross an offer from the same user
+    MANAGE_SELL_OFFER_SELL_NO_ISSUER = -9, // no issuer for what we're selling
+    MANAGE_SELL_OFFER_BUY_NO_ISSUER = -10, // no issuer for what we're buying
 
     // update errors
-    MANAGE_OFFER_NOT_FOUND = -11, // offerID does not match an existing offer
+    MANAGE_SELL_OFFER_NOT_FOUND =
+        -11, // offerID does not match an existing offer
 
-    MANAGE_OFFER_LOW_RESERVE = -12 // not enough funds to create a new Offer
+    MANAGE_SELL_OFFER_LOW_RESERVE =
+        -12 // not enough funds to create a new Offer
 };
 
 enum ManageOfferEffect
@@ -500,9 +811,43 @@ struct ManageOfferSuccessResult
     offer;
 };
 
-union ManageOfferResult switch (ManageOfferResultCode code)
+union ManageSellOfferResult switch (ManageSellOfferResultCode code)
 {
-case MANAGE_OFFER_SUCCESS:
+case MANAGE_SELL_OFFER_SUCCESS:
+    ManageOfferSuccessResult success;
+default:
+    void;
+};
+
+/******* ManageBuyOffer Result ********/
+
+enum ManageBuyOfferResultCode
+{
+    // codes considered as "success" for the operation
+    MANAGE_BUY_OFFER_SUCCESS = 0,
+
+    // codes considered as "failure" for the operation
+    MANAGE_BUY_OFFER_MALFORMED = -1,     // generated offer would be invalid
+    MANAGE_BUY_OFFER_SELL_NO_TRUST = -2, // no trust line for what we're selling
+    MANAGE_BUY_OFFER_BUY_NO_TRUST = -3,  // no trust line for what we're buying
+    MANAGE_BUY_OFFER_SELL_NOT_AUTHORIZED = -4, // not authorized to sell
+    MANAGE_BUY_OFFER_BUY_NOT_AUTHORIZED = -5,  // not authorized to buy
+    MANAGE_BUY_OFFER_LINE_FULL = -6,   // can't receive more of what it's buying
+    MANAGE_BUY_OFFER_UNDERFUNDED = -7, // doesn't hold what it's trying to sell
+    MANAGE_BUY_OFFER_CROSS_SELF = -8, // would cross an offer from the same user
+    MANAGE_BUY_OFFER_SELL_NO_ISSUER = -9, // no issuer for what we're selling
+    MANAGE_BUY_OFFER_BUY_NO_ISSUER = -10, // no issuer for what we're buying
+
+    // update errors
+    MANAGE_BUY_OFFER_NOT_FOUND =
+        -11, // offerID does not match an existing offer
+
+    MANAGE_BUY_OFFER_LOW_RESERVE = -12 // not enough funds to create a new Offer
+};
+
+union ManageBuyOfferResult switch (ManageBuyOfferResultCode code)
+{
+case MANAGE_BUY_OFFER_SUCCESS:
     ManageOfferSuccessResult success;
 default:
     void;
@@ -545,7 +890,8 @@ enum ChangeTrustResultCode
     CHANGE_TRUST_NO_ISSUER = -2,     // could not find issuer
     CHANGE_TRUST_INVALID_LIMIT = -3, // cannot drop limit below balance
                                      // cannot create with a limit of 0
-    CHANGE_TRUST_LOW_RESERVE = -4, // not enough funds to create a new trust line,
+    CHANGE_TRUST_LOW_RESERVE =
+        -4, // not enough funds to create a new trust line,
     CHANGE_TRUST_SELF_NOT_ALLOWED = -5 // trusting self is not allowed
 };
 
@@ -568,7 +914,7 @@ enum AllowTrustResultCode
     ALLOW_TRUST_NO_TRUST_LINE = -2, // trustor does not have a trustline
                                     // source account does not require trust
     ALLOW_TRUST_TRUST_NOT_REQUIRED = -3,
-    ALLOW_TRUST_CANT_REVOKE = -4, // source account can't revoke trust,
+    ALLOW_TRUST_CANT_REVOKE = -4,     // source account can't revoke trust,
     ALLOW_TRUST_SELF_NOT_ALLOWED = -5 // trusting self is not allowed
 };
 
@@ -587,10 +933,14 @@ enum AccountMergeResultCode
     // codes considered as "success" for the operation
     ACCOUNT_MERGE_SUCCESS = 0,
     // codes considered as "failure" for the operation
-    ACCOUNT_MERGE_MALFORMED = -1,      // can't merge onto itself
-    ACCOUNT_MERGE_NO_ACCOUNT = -2,     // destination does not exist
-    ACCOUNT_MERGE_IMMUTABLE_SET = -3,  // source account has AUTH_IMMUTABLE set
-    ACCOUNT_MERGE_HAS_SUB_ENTRIES = -4 // account has trust lines/offers
+    ACCOUNT_MERGE_MALFORMED = -1,       // can't merge onto itself
+    ACCOUNT_MERGE_NO_ACCOUNT = -2,      // destination does not exist
+    ACCOUNT_MERGE_IMMUTABLE_SET = -3,   // source account has AUTH_IMMUTABLE set
+    ACCOUNT_MERGE_HAS_SUB_ENTRIES = -4, // account has trust lines/offers
+    ACCOUNT_MERGE_SEQNUM_TOO_FAR = -5,  // sequence number is over max allowed
+    ACCOUNT_MERGE_DEST_FULL = -6,       // can't add source balance to
+                                        // destination balance
+    ACCOUNT_MERGE_IS_SPONSOR = -7       // can't merge account that is a sponsor
 };
 
 union AccountMergeResult switch (AccountMergeResultCode code)
@@ -632,10 +982,12 @@ enum ManageDataResultCode
     // codes considered as "success" for the operation
     MANAGE_DATA_SUCCESS = 0,
     // codes considered as "failure" for the operation
-    MANAGE_DATA_NOT_SUPPORTED_YET = -1, // The network hasn't moved to this protocol change yet
-    MANAGE_DATA_NAME_NOT_FOUND = -2,    // Trying to remove a Data Entry that isn't there
-    MANAGE_DATA_LOW_RESERVE = -3,       // not enough funds to create a new Data Entry
-    MANAGE_DATA_INVALID_NAME = -4       // Name not a valid string
+    MANAGE_DATA_NOT_SUPPORTED_YET =
+        -1, // The network hasn't moved to this protocol change yet
+    MANAGE_DATA_NAME_NOT_FOUND =
+        -2, // Trying to remove a Data Entry that isn't there
+    MANAGE_DATA_LOW_RESERVE = -3, // not enough funds to create a new Data Entry
+    MANAGE_DATA_INVALID_NAME = -4 // Name not a valid string
 };
 
 union ManageDataResult switch (ManageDataResultCode code)
@@ -646,14 +998,139 @@ default:
     void;
 };
 
-/* High level Operation Result */
+/******* BumpSequence Result ********/
 
+enum BumpSequenceResultCode
+{
+    // codes considered as "success" for the operation
+    BUMP_SEQUENCE_SUCCESS = 0,
+    // codes considered as "failure" for the operation
+    BUMP_SEQUENCE_BAD_SEQ = -1 // `bumpTo` is not within bounds
+};
+
+union BumpSequenceResult switch (BumpSequenceResultCode code)
+{
+case BUMP_SEQUENCE_SUCCESS:
+    void;
+default:
+    void;
+};
+
+/******* CreateClaimableBalance Result ********/
+
+enum CreateClaimableBalanceResultCode
+{
+    CREATE_CLAIMABLE_BALANCE_SUCCESS = 0,
+    CREATE_CLAIMABLE_BALANCE_MALFORMED = -1,
+    CREATE_CLAIMABLE_BALANCE_LOW_RESERVE = -2,
+    CREATE_CLAIMABLE_BALANCE_NO_TRUST = -3,
+    CREATE_CLAIMABLE_BALANCE_NOT_AUTHORIZED = -4,
+    CREATE_CLAIMABLE_BALANCE_UNDERFUNDED = -5
+};
+
+union CreateClaimableBalanceResult switch (
+    CreateClaimableBalanceResultCode code)
+{
+case CREATE_CLAIMABLE_BALANCE_SUCCESS:
+    ClaimableBalanceID balanceID;
+default:
+    void;
+};
+
+/******* ClaimClaimableBalance Result ********/
+
+enum ClaimClaimableBalanceResultCode
+{
+    CLAIM_CLAIMABLE_BALANCE_SUCCESS = 0,
+    CLAIM_CLAIMABLE_BALANCE_DOES_NOT_EXIST = -1,
+    CLAIM_CLAIMABLE_BALANCE_CANNOT_CLAIM = -2,
+    CLAIM_CLAIMABLE_BALANCE_LINE_FULL = -3,
+    CLAIM_CLAIMABLE_BALANCE_NO_TRUST = -4,
+    CLAIM_CLAIMABLE_BALANCE_NOT_AUTHORIZED = -5
+
+};
+
+union ClaimClaimableBalanceResult switch (ClaimClaimableBalanceResultCode code)
+{
+case CLAIM_CLAIMABLE_BALANCE_SUCCESS:
+    void;
+default:
+    void;
+};
+
+/******* BeginSponsoringFutureReserves Result ********/
+
+enum BeginSponsoringFutureReservesResultCode
+{
+    // codes considered as "success" for the operation
+    BEGIN_SPONSORING_FUTURE_RESERVES_SUCCESS = 0,
+
+    // codes considered as "failure" for the operation
+    BEGIN_SPONSORING_FUTURE_RESERVES_MALFORMED = -1,
+    BEGIN_SPONSORING_FUTURE_RESERVES_ALREADY_SPONSORED = -2,
+    BEGIN_SPONSORING_FUTURE_RESERVES_RECURSIVE = -3
+};
+
+union BeginSponsoringFutureReservesResult switch (BeginSponsoringFutureReservesResultCode code)
+{
+case BEGIN_SPONSORING_FUTURE_RESERVES_SUCCESS:
+    void;
+default:
+    void;
+};
+
+/******* EndSponsoringFutureReserves Result ********/
+
+enum EndSponsoringFutureReservesResultCode
+{
+    // codes considered as "success" for the operation
+    END_SPONSORING_FUTURE_RESERVES_SUCCESS = 0,
+
+    // codes considered as "failure" for the operation
+    END_SPONSORING_FUTURE_RESERVES_NOT_SPONSORED = -1
+};
+
+union EndSponsoringFutureReservesResult switch (EndSponsoringFutureReservesResultCode code)
+{
+case END_SPONSORING_FUTURE_RESERVES_SUCCESS:
+    void;
+default:
+    void;
+};
+
+/******* RevokeSponsorship Result ********/
+
+enum RevokeSponsorshipResultCode
+{
+    // codes considered as "success" for the operation
+    REVOKE_SPONSORSHIP_SUCCESS = 0,
+
+    // codes considered as "failure" for the operation
+    REVOKE_SPONSORSHIP_DOES_NOT_EXIST = -1,
+    REVOKE_SPONSORSHIP_NOT_SPONSOR = -2,
+    REVOKE_SPONSORSHIP_LOW_RESERVE = -3,
+    REVOKE_SPONSORSHIP_ONLY_TRANSFERABLE = -4
+};
+
+union RevokeSponsorshipResult switch (RevokeSponsorshipResultCode code)
+{
+case REVOKE_SPONSORSHIP_SUCCESS:
+    void;
+default:
+    void;
+};
+
+/* High level Operation Result */
 enum OperationResultCode
 {
     opINNER = 0, // inner object result is valid
 
-    opBAD_AUTH = -1,  // too few valid signatures / wrong network
-    opNO_ACCOUNT = -2 // source account was not found
+    opBAD_AUTH = -1,            // too few valid signatures / wrong network
+    opNO_ACCOUNT = -2,          // source account was not found
+    opNOT_SUPPORTED = -3,       // operation not supported at this time
+    opTOO_MANY_SUBENTRIES = -4, // max number of subentries already reached
+    opEXCEEDED_WORK_LIMIT = -5, // operation did too much work
+    opTOO_MANY_SPONSORING = -6  // account is sponsoring too many entries
 };
 
 union OperationResult switch (OperationResultCode code)
@@ -665,12 +1142,12 @@ case opINNER:
         CreateAccountResult createAccountResult;
     case PAYMENT:
         PaymentResult paymentResult;
-    case PATH_PAYMENT:
-        PathPaymentResult pathPaymentResult;
-    case MANAGE_OFFER:
-        ManageOfferResult manageOfferResult;
-    case CREATE_PASSIVE_OFFER:
-        ManageOfferResult createPassiveOfferResult;
+    case PATH_PAYMENT_STRICT_RECEIVE:
+        PathPaymentStrictReceiveResult pathPaymentStrictReceiveResult;
+    case MANAGE_SELL_OFFER:
+        ManageSellOfferResult manageSellOfferResult;
+    case CREATE_PASSIVE_SELL_OFFER:
+        ManageSellOfferResult createPassiveSellOfferResult;
     case SET_OPTIONS:
         SetOptionsResult setOptionsResult;
     case CHANGE_TRUST:
@@ -683,6 +1160,22 @@ case opINNER:
         InflationResult inflationResult;
     case MANAGE_DATA:
         ManageDataResult manageDataResult;
+    case BUMP_SEQUENCE:
+        BumpSequenceResult bumpSeqResult;
+    case MANAGE_BUY_OFFER:
+        ManageBuyOfferResult manageBuyOfferResult;
+    case PATH_PAYMENT_STRICT_SEND:
+        PathPaymentStrictSendResult pathPaymentStrictSendResult;
+    case CREATE_CLAIMABLE_BALANCE:
+        CreateClaimableBalanceResult createClaimableBalanceResult;
+    case CLAIM_CLAIMABLE_BALANCE:
+        ClaimClaimableBalanceResult claimClaimableBalanceResult;
+    case BEGIN_SPONSORING_FUTURE_RESERVES:
+        BeginSponsoringFutureReservesResult beginSponsoringFutureReservesResult;
+    case END_SPONSORING_FUTURE_RESERVES:
+        EndSponsoringFutureReservesResult endSponsoringFutureReservesResult;
+    case REVOKE_SPONSORSHIP:
+        RevokeSponsorshipResult revokeSponsorshipResult;
     }
     tr;
 default:
@@ -691,7 +1184,8 @@ default:
 
 enum TransactionResultCode
 {
-    txSUCCESS = 0, // all operations succeeded
+    txFEE_BUMP_INNER_SUCCESS = 1, // fee bump inner transaction succeeded
+    txSUCCESS = 0,                // all operations succeeded
 
     txFAILED = -1, // one of the operations failed (none were applied)
 
@@ -705,7 +1199,56 @@ enum TransactionResultCode
     txNO_ACCOUNT = -8,           // source account not found
     txINSUFFICIENT_FEE = -9,     // fee is too small
     txBAD_AUTH_EXTRA = -10,      // unused signatures attached to transaction
-    txINTERNAL_ERROR = -11       // an unknown error occured
+    txINTERNAL_ERROR = -11,      // an unknown error occured
+
+    txNOT_SUPPORTED = -12,         // transaction type not supported
+    txFEE_BUMP_INNER_FAILED = -13, // fee bump inner transaction failed
+    txBAD_SPONSORSHIP = -14        // sponsorship not confirmed
+};
+
+// InnerTransactionResult must be binary compatible with TransactionResult
+// because it is be used to represent the result of a Transaction.
+struct InnerTransactionResult
+{
+    // Always 0. Here for binary compatibility.
+    int64 feeCharged;
+
+    union switch (TransactionResultCode code)
+    {
+    // txFEE_BUMP_INNER_SUCCESS is not included
+    case txSUCCESS:
+    case txFAILED:
+        OperationResult results<>;
+    case txTOO_EARLY:
+    case txTOO_LATE:
+    case txMISSING_OPERATION:
+    case txBAD_SEQ:
+    case txBAD_AUTH:
+    case txINSUFFICIENT_BALANCE:
+    case txNO_ACCOUNT:
+    case txINSUFFICIENT_FEE:
+    case txBAD_AUTH_EXTRA:
+    case txINTERNAL_ERROR:
+    case txNOT_SUPPORTED:
+    // txFEE_BUMP_INNER_FAILED is not included
+    case txBAD_SPONSORSHIP:
+        void;
+    }
+    result;
+
+    // reserved for future use
+    union switch (int v)
+    {
+    case 0:
+        void;
+    }
+    ext;
+};
+
+struct InnerTransactionResultPair
+{
+    Hash transactionHash;          // hash of the inner transaction
+    InnerTransactionResult result; // result for the inner transaction
 };
 
 struct TransactionResult
@@ -714,6 +1257,9 @@ struct TransactionResult
 
     union switch (TransactionResultCode code)
     {
+    case txFEE_BUMP_INNER_SUCCESS:
+    case txFEE_BUMP_INNER_FAILED:
+        InnerTransactionResultPair innerResultPair;
     case txSUCCESS:
     case txFAILED:
         OperationResult results<>;

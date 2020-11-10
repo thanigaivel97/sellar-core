@@ -9,13 +9,14 @@
 #include "main/Config.h"
 #include "util/Fs.h"
 #include "util/Logging.h"
-#include "util/make_unique.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
 
 TmpDir::TmpDir(std::string const& prefix)
 {
+    ZoneScoped;
     size_t attempts = 0;
     for (;;)
     {
@@ -23,7 +24,7 @@ TmpDir::TmpDir(std::string const& prefix)
         std::string name = prefix + "-" + hex;
         if (fs::mkpath(name))
         {
-            mPath = make_unique<std::string>(name);
+            mPath = std::make_unique<std::string>(name);
             break;
         }
         if (++attempts > 100)
@@ -45,6 +46,7 @@ TmpDir::getName() const
 
 TmpDir::~TmpDir()
 {
+    ZoneScoped;
     if (!mPath)
     {
         return;
@@ -52,8 +54,11 @@ TmpDir::~TmpDir()
 
     try
     {
-        fs::deltree(*mPath);
-        LOG(DEBUG) << "TmpDir deleted: " << *mPath;
+        if (fs::exists(*mPath))
+        {
+            fs::deltree(*mPath);
+            LOG(DEBUG) << "TmpDir deleted: " << *mPath;
+        }
     }
     catch (std::runtime_error& e)
     {
@@ -78,6 +83,7 @@ TmpDirManager::~TmpDirManager()
 void
 TmpDirManager::clean()
 {
+    ZoneScoped;
     if (fs::exists(mRoot))
     {
         LOG(DEBUG) << "TmpDirManager cleaning: " << mRoot;

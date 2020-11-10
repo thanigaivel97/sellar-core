@@ -5,19 +5,21 @@
 #include "util/asio.h"
 #include "transactions/ManageDataOpFrame.h"
 #include "database/Database.h"
-#include "ledger/DataFrame.h"
-#include "ledger/LedgerDelta.h"
+#include "ledger/LedgerTxn.h"
+#include "ledger/LedgerTxnEntry.h"
+#include "ledger/LedgerTxnHeader.h"
 #include "main/Application.h"
-#include "medida/meter.h"
-#include "medida/metrics_registry.h"
+#include "transactions/SponsorshipUtils.h"
+#include "transactions/TransactionUtils.h"
 #include "util/Logging.h"
+#include "util/XDROperators.h"
 #include "util/types.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
 
 using namespace std;
-using xdr::operator==;
 
 ManageDataOpFrame::ManageDataOpFrame(Operation const& op, OperationResult& res,
                                      TransactionFrame& parentTx)
@@ -27,86 +29,80 @@ ManageDataOpFrame::ManageDataOpFrame(Operation const& op, OperationResult& res,
 }
 
 bool
-ManageDataOpFrame::doApply(Application& app, LedgerDelta& delta,
-                           LedgerManager& ledgerManager)
+ManageDataOpFrame::doApply(AbstractLedgerTxn& ltx)
 {
-    if (app.getLedgerManager().getCurrentLedgerVersion() == 3)
+    ZoneNamedN(applyZone, "ManageDataOp apply", true);
+    auto header = ltx.loadHeader();
+    if (header.current().ledgerVersion == 3)
     {
         throw std::runtime_error(
             "MANAGE_DATA not supported on ledger version 3");
     }
 
-    Database& db = ledgerManager.getDatabase();
-
-    auto dataFrame =
-        DataFrame::loadData(mSourceAccount->getID(), mManageData.dataName, db);
-
+    auto data = stellar::loadData(ltx, getSourceID(), mManageData.dataName);
     if (mManageData.dataValue)
     {
-        if (!dataFrame)
+        if (!data)
         { // create a new data entry
+            LedgerEntry newData;
+            newData.data.type(DATA);
+            auto& dataEntry = newData.data.data();
+            dataEntry.accountID = getSourceID();
+            dataEntry.dataName = mManageData.dataName;
+            dataEntry.dataValue = *mManageData.dataValue;
 
-            if (!mSourceAccount->addNumEntries(1, ledgerManager))
+            auto sourceAccount = loadSourceAccount(ltx, header);
+            switch (createEntryWithPossibleSponsorship(ltx, header, newData,
+                                                       sourceAccount))
             {
-                app.getMetrics()
-                    .NewMeter({"op-manage-data", "invalid", "low reserve"},
-                              "operation")
-                    .Mark();
+            case SponsorshipResult::SUCCESS:
+                break;
+            case SponsorshipResult::LOW_RESERVE:
                 innerResult().code(MANAGE_DATA_LOW_RESERVE);
                 return false;
+            case SponsorshipResult::TOO_MANY_SUBENTRIES:
+                mResult.code(opTOO_MANY_SUBENTRIES);
+                return false;
+            case SponsorshipResult::TOO_MANY_SPONSORING:
+                mResult.code(opTOO_MANY_SPONSORING);
+                return false;
+            case SponsorshipResult::TOO_MANY_SPONSORED:
+                // This is impossible right now because there is a limit on sub
+                // entries, fall through and throw
+            default:
+                throw std::runtime_error("Unexpected result from "
+                                         "createEntryWithPossibleSponsorship");
             }
-
-            dataFrame = std::make_shared<DataFrame>();
-            dataFrame->getData().accountID = mSourceAccount->getID();
-            dataFrame->getData().dataName = mManageData.dataName;
-            dataFrame->getData().dataValue = *mManageData.dataValue;
-
-            dataFrame->storeAdd(delta, db);
-            mSourceAccount->storeChange(delta, db);
+            ltx.create(newData);
         }
         else
         { // modify an existing entry
-            delta.recordEntry(*dataFrame);
-            dataFrame->getData().dataValue = *mManageData.dataValue;
-            dataFrame->storeChange(delta, db);
+            data.current().data.data().dataValue = *mManageData.dataValue;
         }
     }
     else
     { // delete an existing piece of data
-
-        if (!dataFrame)
+        if (!data)
         {
-            app.getMetrics()
-                .NewMeter({"op-manage-data", "invalid", "not-found"},
-                          "operation")
-                .Mark();
             innerResult().code(MANAGE_DATA_NAME_NOT_FOUND);
             return false;
         }
-        delta.recordEntry(*dataFrame);
-        mSourceAccount->addNumEntries(-1, ledgerManager);
-        mSourceAccount->storeChange(delta, db);
-        dataFrame->storeDelete(delta, db);
+
+        auto sourceAccount = loadSourceAccount(ltx, header);
+        removeEntryWithPossibleSponsorship(ltx, header, data.current(),
+                                           sourceAccount);
+        data.erase();
     }
 
     innerResult().code(MANAGE_DATA_SUCCESS);
-
-    app.getMetrics()
-        .NewMeter({"op-manage-data", "success", "apply"}, "operation")
-        .Mark();
     return true;
 }
 
 bool
-ManageDataOpFrame::doCheckValid(Application& app)
+ManageDataOpFrame::doCheckValid(uint32_t ledgerVersion)
 {
-    if (app.getLedgerManager().getCurrentLedgerVersion() < 2)
+    if (ledgerVersion < 2)
     {
-        app.getMetrics()
-            .NewMeter(
-                {"op-set-options", "invalid", "invalid-data-old-protocol"},
-                "operation")
-            .Mark();
         innerResult().code(MANAGE_DATA_NOT_SUPPORTED_YET);
         return false;
     }
@@ -114,14 +110,17 @@ ManageDataOpFrame::doCheckValid(Application& app)
     if ((mManageData.dataName.size() < 1) ||
         (!isString32Valid(mManageData.dataName)))
     {
-        app.getMetrics()
-            .NewMeter({"op-set-options", "invalid", "invalid-data-name"},
-                      "operation")
-            .Mark();
         innerResult().code(MANAGE_DATA_INVALID_NAME);
         return false;
     }
 
     return true;
+}
+
+void
+ManageDataOpFrame::insertLedgerKeysToPrefetch(
+    std::unordered_set<LedgerKey>& keys) const
+{
+    keys.emplace(dataKey(getSourceID(), mManageData.dataName));
 }
 }

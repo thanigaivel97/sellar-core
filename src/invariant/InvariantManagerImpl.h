@@ -5,13 +5,13 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "invariant/InvariantManager.h"
-#include "util/make_unique.h"
 #include <map>
 #include <vector>
 
 namespace medida
 {
 class MetricsRegistry;
+class Counter;
 }
 
 namespace stellar
@@ -21,7 +21,7 @@ class InvariantManagerImpl : public InvariantManager
 {
     std::map<std::string, std::shared_ptr<Invariant>> mInvariants;
     std::vector<std::shared_ptr<Invariant>> mEnabled;
-    medida::MetricsRegistry& mMetricsRegistry;
+    medida::Counter& mInvariantFailureCount;
 
     struct InvariantFailureInformation
     {
@@ -33,11 +33,13 @@ class InvariantManagerImpl : public InvariantManager
   public:
     InvariantManagerImpl(medida::MetricsRegistry& registry);
 
-    virtual Json::Value getInformation() override;
+    virtual Json::Value getJsonInfo() override;
+
+    virtual std::vector<std::string> getEnabledInvariants() const override;
 
     virtual void checkOnOperationApply(Operation const& operation,
                                        OperationResult const& opres,
-                                       LedgerDelta const& delta) override;
+                                       LedgerTxnDelta const& ltxDelta) override;
 
     virtual void checkOnBucketApply(std::shared_ptr<Bucket const> bucket,
                                     uint32_t ledger, uint32_t level,

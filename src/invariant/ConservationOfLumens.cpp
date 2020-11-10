@@ -4,13 +4,55 @@
 
 #include "invariant/ConservationOfLumens.h"
 #include "invariant/InvariantManager.h"
-#include "ledger/LedgerDelta.h"
-#include "lib/util/format.h"
+#include "ledger/LedgerTxn.h"
 #include "main/Application.h"
+#include <fmt/format.h>
 #include <numeric>
 
 namespace stellar
 {
+
+static int64_t
+calculateDeltaBalance(LedgerEntry const* current, LedgerEntry const* previous)
+{
+    assert(current || previous);
+    auto let = current ? current->data.type() : previous->data.type();
+    if (let == ACCOUNT)
+    {
+        return (current ? current->data.account().balance : 0) -
+               (previous ? previous->data.account().balance : 0);
+    }
+    if (let == CLAIMABLE_BALANCE)
+    {
+        auto const& asset = current ? current->data.claimableBalance().asset
+                                    : previous->data.claimableBalance().asset;
+
+        if (asset.type() != ASSET_TYPE_NATIVE)
+        {
+            return 0;
+        }
+
+        return ((current ? current->data.claimableBalance().amount : 0) -
+                (previous ? previous->data.claimableBalance().amount : 0));
+    }
+    return 0;
+}
+
+static int64_t
+calculateDeltaBalance(
+    std::shared_ptr<InternalLedgerEntry const> const& genCurrent,
+    std::shared_ptr<InternalLedgerEntry const> const& genPrevious)
+{
+    auto type = genCurrent ? genCurrent->type() : genPrevious->type();
+    if (type == InternalLedgerEntryType::LEDGER_ENTRY)
+    {
+        auto const* current = genCurrent ? &genCurrent->ledgerEntry() : nullptr;
+        auto const* previous =
+            genPrevious ? &genPrevious->ledgerEntry() : nullptr;
+        return calculateDeltaBalance(current, previous);
+    }
+    return 0;
+}
 
 ConservationOfLumens::ConservationOfLumens() : Invariant(false)
 {
@@ -28,46 +70,21 @@ ConservationOfLumens::getName() const
     return "ConservationOfLumens";
 }
 
-int64_t
-ConservationOfLumens::calculateDeltaBalance(LedgerEntry const* current,
-                                            LedgerEntry const* previous) const
-{
-    assert(current || previous);
-    auto let = current ? current->data.type() : previous->data.type();
-    if (let == ACCOUNT)
-    {
-        return (current ? current->data.account().balance : 0) -
-               (previous ? previous->data.account().balance : 0);
-    }
-    return 0;
-}
-
 std::string
 ConservationOfLumens::checkOnOperationApply(Operation const& operation,
                                             OperationResult const& result,
-                                            LedgerDelta const& delta)
+                                            LedgerTxnDelta const& ltxDelta)
 {
-    auto const& lhCurr = delta.getHeader();
-    auto const& lhPrev = delta.getPreviousHeader();
+    auto const& lhCurr = ltxDelta.header.current;
+    auto const& lhPrev = ltxDelta.header.previous;
 
     int64_t deltaTotalCoins = lhCurr.totalCoins - lhPrev.totalCoins;
     int64_t deltaFeePool = lhCurr.feePool - lhPrev.feePool;
     int64_t deltaBalances = std::accumulate(
-        delta.added().begin(), delta.added().end(), static_cast<int64_t>(0),
-        [this](int64_t lhs, LedgerDelta::AddedLedgerEntry const& rhs) {
-            return lhs + calculateDeltaBalance(&rhs.current->mEntry, nullptr);
-        });
-    deltaBalances += std::accumulate(
-        delta.modified().begin(), delta.modified().end(),
-        static_cast<int64_t>(0),
-        [this](int64_t lhs, LedgerDelta::ModifiedLedgerEntry const& rhs) {
-            return lhs + calculateDeltaBalance(&rhs.current->mEntry,
-                                               &rhs.previous->mEntry);
-        });
-    deltaBalances += std::accumulate(
-        delta.deleted().begin(), delta.deleted().end(), static_cast<int64_t>(0),
-        [this](int64_t lhs, LedgerDelta::DeletedLedgerEntry const& rhs) {
-            return lhs + calculateDeltaBalance(nullptr, &rhs.previous->mEntry);
+        ltxDelta.entry.begin(), ltxDelta.entry.end(), static_cast<int64_t>(0),
+        [](int64_t lhs, decltype(ltxDelta.entry)::value_type const& rhs) {
+            return lhs + stellar::calculateDeltaBalance(rhs.second.current,
+                                                        rhs.second.previous);
         });
 
     if (result.tr().type() == INFLATION)

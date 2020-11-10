@@ -4,7 +4,8 @@
 
 #include "Application.h"
 #include "ApplicationImpl.h"
-#include "util/format.h"
+#include "util/GlobalChecks.h"
+#include <fmt/format.h>
 
 namespace stellar
 {

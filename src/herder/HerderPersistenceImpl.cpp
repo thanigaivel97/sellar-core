@@ -5,13 +5,15 @@
 #include "herder/HerderPersistenceImpl.h"
 #include "crypto/Hex.h"
 #include "database/Database.h"
+#include "database/DatabaseUtils.h"
 #include "herder/Herder.h"
 #include "main/Application.h"
 #include "scp/Slot.h"
-#include "util/SociNoWarnings.h"
+#include "util/Decoder.h"
 #include "util/XDRStream.h"
-#include "util/make_unique.h"
-#include <lib/util/basen.h>
+#include <Tracy.hpp>
+
+#include <soci.h>
 #include <xdrpp/marshal.h>
 
 namespace stellar
@@ -20,7 +22,7 @@ namespace stellar
 std::unique_ptr<HerderPersistence>
 HerderPersistence::create(Application& app)
 {
-    return make_unique<HerderPersistenceImpl>(app);
+    return std::make_unique<HerderPersistenceImpl>(app);
 }
 
 HerderPersistenceImpl::HerderPersistenceImpl(Application& app) : mApp(app)
@@ -33,8 +35,10 @@ HerderPersistenceImpl::~HerderPersistenceImpl()
 
 void
 HerderPersistenceImpl::saveSCPHistory(uint32_t seq,
-                                      std::vector<SCPEnvelope> const& envs)
+                                      std::vector<SCPEnvelope> const& envs,
+                                      QuorumTracker::QuorumMap const& qmap)
 {
+    ZoneScoped;
     if (envs.empty())
     {
         return;
@@ -69,7 +73,7 @@ HerderPersistenceImpl::saveSCPHistory(uint32_t seq,
         auto envelopeBytes(xdr::xdr_to_opaque(e));
 
         std::string envelopeEncoded;
-        envelopeEncoded = bn::encode_b64(envelopeBytes);
+        envelopeEncoded = decoder::encode_b64(envelopeBytes);
 
         auto prepEnv =
             db.getPreparedStatement("INSERT INTO scphistory "
@@ -91,28 +95,96 @@ HerderPersistenceImpl::saveSCPHistory(uint32_t seq,
         }
     }
 
+    // save quorum information
+    for (auto const& p : qmap)
+    {
+        auto const& nodeID = p.first;
+        if (!p.second.mQuorumSet)
+        {
+            // skip node if we don't have its quorum set
+            continue;
+        }
+        auto qSetH = sha256(xdr::xdr_to_opaque(*(p.second.mQuorumSet)));
+        usedQSets.insert(std::make_pair(qSetH, p.second.mQuorumSet));
+
+        std::string nodeIDStrKey = KeyUtils::toStrKey(nodeID);
+        std::string qSetHHex(binToHex(qSetH));
+
+        auto prep = db.getPreparedStatement(
+            "UPDATE quoruminfo SET qsethash = :h WHERE nodeid = :id");
+        auto& st = prep.statement();
+        st.exchange(soci::use(qSetHHex));
+        st.exchange(soci::use(nodeIDStrKey));
+        st.define_and_bind();
+        {
+            auto timer = db.getInsertTimer("quoruminfo");
+            st.execute(true);
+        }
+        if (st.get_affected_rows() != 1)
+        {
+            auto prepI = db.getPreparedStatement(
+                "INSERT INTO quoruminfo (nodeid, qsethash) VALUES (:id, :h)");
+            auto& stI = prepI.statement();
+            stI.exchange(soci::use(nodeIDStrKey));
+            stI.exchange(soci::use(qSetHHex));
+            stI.define_and_bind();
+            {
+                auto timer = db.getInsertTimer("quoruminfo");
+                stI.execute(true);
+            }
+            if (stI.get_affected_rows() != 1)
+            {
+                throw std::runtime_error("Could not update data in SQL");
+            }
+        }
+    }
+    // save quorum sets
     for (auto const& p : usedQSets)
     {
         std::string qSetH = binToHex(p.first);
 
-        auto prepUpQSet =
-            db.getPreparedStatement("UPDATE scpquorums SET "
-                                    "lastledgerseq = :l WHERE qsethash = :h");
-
-        auto& stUp = prepUpQSet.statement();
-        stUp.exchange(soci::use(seq));
-        stUp.exchange(soci::use(qSetH));
-        stUp.define_and_bind();
+        uint32_t lastSeenSeq;
+        auto prepSelQSet = db.getPreparedStatement(
+            "SELECT lastledgerseq FROM scpquorums WHERE qsethash = :h");
+        auto& stSel = prepSelQSet.statement();
+        stSel.exchange(soci::into(lastSeenSeq));
+        stSel.exchange(soci::use(qSetH));
+        stSel.define_and_bind();
         {
-            auto timer = db.getInsertTimer("scpquorums");
-            stUp.execute(true);
+            auto timer = db.getSelectTimer("scpquorums");
+            stSel.execute(true);
         }
-        if (stUp.get_affected_rows() != 1)
+
+        if (stSel.got_data())
+        {
+            if (lastSeenSeq >= seq)
+            {
+                continue;
+            }
+
+            auto prepUpQSet = db.getPreparedStatement(
+                "UPDATE scpquorums SET "
+                "lastledgerseq = :l WHERE qsethash = :h");
+
+            auto& stUp = prepUpQSet.statement();
+            stUp.exchange(soci::use(seq));
+            stUp.exchange(soci::use(qSetH));
+            stUp.define_and_bind();
+            {
+                auto timer = db.getInsertTimer("scpquorums");
+                stUp.execute(true);
+            }
+            if (stUp.get_affected_rows() != 1)
+            {
+                throw std::runtime_error("Could not update data in SQL");
+            }
+        }
+        else
         {
             auto qSetBytes(xdr::xdr_to_opaque(*p.second));
 
             std::string qSetEncoded;
-            qSetEncoded = bn::encode_b64(qSetBytes);
+            qSetEncoded = decoder::encode_b64(qSetBytes);
 
             auto prepInsQSet = db.getPreparedStatement(
                 "INSERT INTO scpquorums "
@@ -144,6 +216,7 @@ HerderPersistence::copySCPHistoryToStream(Database& db, soci::session& sess,
                                           uint32_t ledgerCount,
                                           XDROutputFileStream& scpHistory)
 {
+    ZoneScoped;
     uint32_t begin = ledgerSeq, end = ledgerSeq + ledgerCount;
     size_t n = 0;
 
@@ -183,10 +256,8 @@ HerderPersistence::copySCPHistoryToStream(Database& db, soci::session& sess,
                 auto& env = curEnvs.back();
 
                 std::vector<uint8_t> envBytes;
-                bn::decode_b64(envB64, envBytes);
-
-                xdr::xdr_get g1(&envBytes.front(), &envBytes.back() + 1);
-                xdr_argpack_archive(g1, env);
+                decoder::decode_b64(envB64, envBytes);
+                xdr::xdr_from_opaque(envBytes, env);
 
                 // record new quorum sets encountered
                 Hash const& qSetHash =
@@ -207,30 +278,13 @@ HerderPersistence::copySCPHistoryToStream(Database& db, soci::session& sess,
         {
             std::string qset64, qSetHashHex;
 
-            hEntry.quorumSets.emplace_back();
-            auto& qset = hEntry.quorumSets.back();
-
-            qSetHashHex = binToHex(q);
-
-            auto timer = db.getSelectTimer("scpquorums");
-
-            soci::statement st = (sess.prepare << "SELECT qset FROM scpquorums "
-                                                  "WHERE qsethash = :h",
-                                  soci::into(qset64), soci::use(qSetHashHex));
-
-            st.execute(true);
-
-            if (!st.got_data())
+            auto qset = getQuorumSet(db, sess, q);
+            if (!qset)
             {
                 throw std::runtime_error(
                     "corrupt database state: missing quorum set");
             }
-
-            std::vector<uint8_t> qSetBytes;
-            bn::decode_b64(qset64, qSetBytes);
-
-            xdr::xdr_get g1(&qSetBytes.front(), &qSetBytes.back() + 1);
-            xdr_argpack_archive(g1, qset);
+            hEntry.quorumSets.emplace_back(std::move(*qset));
         }
 
         if (curEnvs.size() != 0)
@@ -242,9 +296,66 @@ HerderPersistence::copySCPHistoryToStream(Database& db, soci::session& sess,
     return n;
 }
 
+optional<Hash>
+HerderPersistence::getNodeQuorumSet(Database& db, soci::session& sess,
+                                    NodeID const& nodeID)
+{
+    ZoneScoped;
+    std::string nodeIDStrKey = KeyUtils::toStrKey(nodeID);
+    std::string qsethHex;
+
+    auto timer = db.getSelectTimer("quoruminfo");
+    soci::statement st = (sess.prepare << "SELECT qsethash FROM quoruminfo "
+                                          "WHERE nodeid = :id",
+                          soci::into(qsethHex), soci::use(nodeIDStrKey));
+
+    st.execute(true);
+
+    optional<Hash> res;
+    if (st.got_data())
+    {
+        auto h = hexToBin256(qsethHex);
+        res = make_optional<Hash>(std::move(h));
+    }
+    return res;
+}
+
+SCPQuorumSetPtr
+HerderPersistence::getQuorumSet(Database& db, soci::session& sess,
+                                Hash const& qSetHash)
+{
+    ZoneScoped;
+    SCPQuorumSetPtr res;
+    SCPQuorumSet qset;
+    std::string qset64, qSetHashHex;
+
+    qSetHashHex = binToHex(qSetHash);
+
+    auto timer = db.getSelectTimer("scpquorums");
+
+    soci::statement st = (sess.prepare << "SELECT qset FROM scpquorums "
+                                          "WHERE qsethash = :h",
+                          soci::into(qset64), soci::use(qSetHashHex));
+
+    st.execute(true);
+
+    if (st.got_data())
+    {
+        std::vector<uint8_t> qSetBytes;
+        decoder::decode_b64(qset64, qSetBytes);
+
+        xdr::xdr_get g1(&qSetBytes.front(), &qSetBytes.back() + 1);
+        xdr_argpack_archive(g1, qset);
+
+        res = std::make_shared<SCPQuorumSet>(std::move(qset));
+    }
+    return res;
+}
+
 void
 HerderPersistence::dropAll(Database& db)
 {
+    ZoneScoped;
     db.getSession() << "DROP TABLE IF EXISTS scphistory";
 
     db.getSession() << "DROP TABLE IF EXISTS scpquorums";
@@ -263,14 +374,30 @@ HerderPersistence::dropAll(Database& db)
                        "qset          TEXT NOT NULL,"
                        "PRIMARY KEY (qsethash)"
                        ")";
+
+    db.getSession()
+        << "CREATE INDEX scpquorumsbyseq ON scpquorums(lastledgerseq)";
+
+    db.getSession() << "DROP TABLE IF EXISTS quoruminfo";
 }
 
 void
-HerderPersistence::deleteOldEntries(Database& db, uint32_t ledgerSeq)
+HerderPersistence::createQuorumTrackingTable(soci::session& sess)
 {
-    db.getSession() << "DELETE FROM scphistory WHERE ledgerseq <= "
-                    << ledgerSeq;
-    db.getSession() << "DELETE FROM scpquorums WHERE lastledgerseq <= "
-                    << ledgerSeq;
+    sess << "CREATE TABLE quoruminfo ("
+            "nodeid      CHARACTER(56) NOT NULL,"
+            "qsethash    CHARACTER(64) NOT NULL,"
+            "PRIMARY KEY (nodeid))";
+}
+
+void
+HerderPersistence::deleteOldEntries(Database& db, uint32_t ledgerSeq,
+                                    uint32_t count)
+{
+    ZoneScoped;
+    DatabaseUtils::deleteOldEntriesHelper(db.getSession(), ledgerSeq, count,
+                                          "scphistory", "ledgerseq");
+    DatabaseUtils::deleteOldEntriesHelper(db.getSession(), ledgerSeq, count,
+                                          "scpquorums", "lastledgerseq");
 }
 }

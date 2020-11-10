@@ -3,20 +3,15 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "TestUtils.h"
-#include "overlay/LoopbackPeer.h"
-#include "util/make_unique.h"
+#include "overlay/test/LoopbackPeer.h"
+#include "test/test.h"
+#include "work/WorkScheduler.h"
 
 namespace stellar
 {
 
 namespace testutil
 {
-
-void
-setCurrentLedgerVersion(LedgerManager& lm, uint32_t currentLedgerVersion)
-{
-    lm.getCurrentLedgerHeader().ledgerVersion = currentLedgerVersion;
-}
 
 void
 crankSome(VirtualClock& clock)
@@ -30,6 +25,29 @@ crankSome(VirtualClock& clock)
 }
 
 void
+crankFor(VirtualClock& clock, VirtualClock::duration duration)
+{
+    auto start = clock.now();
+    while (clock.now() < (start + duration) && clock.crank(false) > 0)
+        ;
+}
+
+void
+shutdownWorkScheduler(Application& app)
+{
+    if (app.getClock().getIOContext().stopped())
+    {
+        throw std::runtime_error("Work scheduler attempted to shutdown after "
+                                 "VirtualClock io context stopped.");
+    }
+    app.getWorkScheduler().shutdown();
+    while (app.getWorkScheduler().getState() != BasicWork::State::WORK_ABORTED)
+    {
+        app.getClock().crank();
+    }
+}
+
+void
 injectSendPeersAndReschedule(VirtualClock::time_point& end, VirtualClock& clock,
                              VirtualTimer& timer,
                              LoopbackPeerConnection& connection)
@@ -38,12 +56,11 @@ injectSendPeersAndReschedule(VirtualClock::time_point& end, VirtualClock& clock,
     if (clock.now() < end && connection.getInitiator()->isConnected())
     {
         timer.expires_from_now(std::chrono::milliseconds(10));
-        timer.async_wait([&](asio::error_code const& ec) {
-            if (!ec)
-            {
+        timer.async_wait(
+            [&]() {
                 injectSendPeersAndReschedule(end, clock, timer, connection);
-            }
-        });
+            },
+            &VirtualTimer::onFailureNoop);
     }
 }
 
@@ -79,7 +96,7 @@ TestApplication::TestApplication(VirtualClock& clock, Config const& cfg)
 std::unique_ptr<InvariantManager>
 TestApplication::createInvariantManager()
 {
-    return make_unique<TestInvariantManager>(getMetrics());
+    return std::make_unique<TestInvariantManager>(getMetrics());
 }
 
 time_t
@@ -87,7 +104,7 @@ getTestDate(int day, int month, int year)
 {
     auto tm = getTestDateTime(day, month, year, 0, 0, 0);
 
-    VirtualClock::time_point tp = VirtualClock::tmToPoint(tm);
+    VirtualClock::system_time_point tp = VirtualClock::tmToSystemPoint(tm);
     time_t t = VirtualClock::to_time_t(tp);
 
     return t;
@@ -106,10 +123,10 @@ getTestDateTime(int day, int month, int year, int hour, int minute, int second)
     return tm;
 }
 
-VirtualClock::time_point
+VirtualClock::system_time_point
 genesis(int minute, int second)
 {
-    return VirtualClock::tmToPoint(
+    return VirtualClock::tmToSystemPoint(
         getTestDateTime(1, 7, 2014, 0, minute, second));
 }
 }

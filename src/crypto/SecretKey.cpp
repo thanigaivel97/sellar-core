@@ -3,6 +3,7 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "crypto/SecretKey.h"
+#include "crypto/Curve25519.h"
 #include "crypto/Hex.h"
 #include "crypto/KeyUtils.h"
 #include "crypto/SHA.h"
@@ -10,12 +11,17 @@
 #include "main/Config.h"
 #include "transactions/SignatureUtils.h"
 #include "util/HashOfHash.h"
-#include "util/lrucache.hpp"
-#include "util/make_unique.h"
+#include "util/Math.h"
+#include "util/RandomEvictionCache.h"
+#include <Tracy.hpp>
 #include <memory>
 #include <mutex>
 #include <sodium.h>
 #include <type_traits>
+
+#ifdef MSAN_ENABLED
+#include <sanitizer/msan_interface.h>
+#endif
 
 namespace stellar
 {
@@ -28,8 +34,7 @@ namespace stellar
 // has no effect on correctness.
 
 static std::mutex gVerifySigCacheMutex;
-static cache::lru_cache<Hash, bool> gVerifySigCache(0xffff);
-static std::unique_ptr<SHA256> gHasher = SHA256::create();
+static RandomEvictionCache<Hash, bool> gVerifySigCache(0xffff);
 static uint64_t gVerifyCacheHit = 0;
 static uint64_t gVerifyCacheMiss = 0;
 
@@ -39,11 +44,11 @@ verifySigCacheKey(PublicKey const& key, Signature const& signature,
 {
     assert(key.type() == PUBLIC_KEY_TYPE_ED25519);
 
-    gHasher->reset();
-    gHasher->add(key.ed25519());
-    gHasher->add(signature);
-    gHasher->add(bin);
-    return gHasher->finish();
+    SHA256 hasher;
+    hasher.add(key.ed25519());
+    hasher.add(signature);
+    hasher.add(bin);
+    return hasher.finish();
 }
 
 SecretKey::SecretKey() : mKeyType(PUBLIC_KEY_TYPE_ED25519)
@@ -68,19 +73,10 @@ SecretKey::Seed::~Seed()
     std::memset(mSeed.data(), 0, mSeed.size());
 }
 
-PublicKey
+PublicKey const&
 SecretKey::getPublicKey() const
 {
-    PublicKey pk;
-
-    assert(mKeyType == PUBLIC_KEY_TYPE_ED25519);
-
-    if (crypto_sign_ed25519_sk_to_pk(pk.ed25519().data(), mSecretKey.data()) !=
-        0)
-    {
-        throw std::runtime_error("error extracting public key from secret key");
-    }
-    return pk;
+    return mPublicKey;
 }
 
 SecretKey::Seed
@@ -93,7 +89,7 @@ SecretKey::getSeed() const
     if (crypto_sign_ed25519_sk_to_seed(seed.mSeed.data(), mSecretKey.data()) !=
         0)
     {
-        throw std::runtime_error("error extracting seed from secret key");
+        throw CryptoError("error extracting seed from secret key");
     }
     return seed;
 }
@@ -128,13 +124,14 @@ SecretKey::isZero() const
 Signature
 SecretKey::sign(ByteSlice const& bin) const
 {
+    ZoneScoped;
     assert(mKeyType == PUBLIC_KEY_TYPE_ED25519);
 
     Signature out(crypto_sign_BYTES, 0);
     if (crypto_sign_detached(out.data(), NULL, bin.data(), bin.size(),
                              mSecretKey.data()) != 0)
     {
-        throw std::runtime_error("error while signing");
+        throw CryptoError("error while signing");
     }
     return out;
 }
@@ -142,31 +139,65 @@ SecretKey::sign(ByteSlice const& bin) const
 SecretKey
 SecretKey::random()
 {
-    PublicKey pk;
     SecretKey sk;
     assert(sk.mKeyType == PUBLIC_KEY_TYPE_ED25519);
-    if (crypto_sign_keypair(pk.ed25519().data(), sk.mSecretKey.data()) != 0)
+    if (crypto_sign_keypair(sk.mPublicKey.ed25519().data(),
+                            sk.mSecretKey.data()) != 0)
     {
-        throw std::runtime_error("error generating random secret key");
+        throw CryptoError("error generating random secret key");
     }
+#ifdef MSAN_ENABLED
+    __msan_unpoison(out.key.data(), out.key.size());
+#endif
     return sk;
 }
+
+#ifdef BUILD_TESTS
+static SecretKey
+pseudoRandomForTestingFromPRNG(std::default_random_engine& engine)
+{
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i < crypto_sign_SEEDBYTES; ++i)
+    {
+        bytes.push_back(static_cast<uint8_t>(engine()));
+    }
+    return SecretKey::fromSeed(bytes);
+}
+
+SecretKey
+SecretKey::pseudoRandomForTesting()
+{
+    // Reminder: this is not cryptographic randomness or even particularly hard
+    // to guess PRNG-ness. It's intended for _deterministic_ use, when you want
+    // "slightly random-ish" keys, for test-data generation.
+    return pseudoRandomForTestingFromPRNG(gRandomEngine);
+}
+
+SecretKey
+SecretKey::pseudoRandomForTestingFromSeed(unsigned int seed)
+{
+    // Reminder: this is not cryptographic randomness or even particularly hard
+    // to guess PRNG-ness. It's intended for _deterministic_ use, when you want
+    // "slightly random-ish" keys, for test-data generation.
+    std::default_random_engine tmpEngine(seed);
+    return pseudoRandomForTestingFromPRNG(tmpEngine);
+}
+#endif
 
 SecretKey
 SecretKey::fromSeed(ByteSlice const& seed)
 {
-    PublicKey pk;
     SecretKey sk;
     assert(sk.mKeyType == PUBLIC_KEY_TYPE_ED25519);
 
     if (seed.size() != crypto_sign_SEEDBYTES)
     {
-        throw std::runtime_error("seed does not match byte size");
+        throw CryptoError("seed does not match byte size");
     }
-    if (crypto_sign_seed_keypair(pk.ed25519().data(), sk.mSecretKey.data(),
-                                 seed.data()) != 0)
+    if (crypto_sign_seed_keypair(sk.mPublicKey.ed25519().data(),
+                                 sk.mSecretKey.data(), seed.data()) != 0)
     {
-        throw std::runtime_error("error generating secret key from seed");
+        throw CryptoError("error generating secret key from seed");
     }
     return sk;
 }
@@ -181,16 +212,15 @@ SecretKey::fromStrKeySeed(std::string const& strKeySeed)
         (seed.size() != crypto_sign_SEEDBYTES) ||
         (strKeySeed.size() != strKey::getStrKeySize(crypto_sign_SEEDBYTES)))
     {
-        throw std::runtime_error("invalid seed");
+        throw CryptoError("invalid seed");
     }
 
-    PublicKey pk;
     SecretKey sk;
     assert(sk.mKeyType == PUBLIC_KEY_TYPE_ED25519);
-    if (crypto_sign_seed_keypair(pk.ed25519().data(), sk.mSecretKey.data(),
-                                 seed.data()) != 0)
+    if (crypto_sign_seed_keypair(sk.mPublicKey.ed25519().data(),
+                                 sk.mSecretKey.data(), seed.data()) != 0)
     {
-        throw std::runtime_error("error generating secret key from seed");
+        throw CryptoError("error generating secret key from seed");
     }
     return sk;
 }
@@ -239,7 +269,7 @@ KeyFunctions<PublicKey>::toKeyType(strKey::StrKeyVersionByte keyVersion)
     case strKey::STRKEY_PUBKEY_ED25519:
         return PublicKeyType::PUBLIC_KEY_TYPE_ED25519;
     default:
-        throw std::invalid_argument("invalid public key type");
+        throw CryptoError("invalid public key type");
     }
 }
 
@@ -251,7 +281,7 @@ KeyFunctions<PublicKey>::toKeyVersion(PublicKeyType keyType)
     case PublicKeyType::PUBLIC_KEY_TYPE_ED25519:
         return strKey::STRKEY_PUBKEY_ED25519;
     default:
-        throw std::invalid_argument("invalid public key type");
+        throw CryptoError("invalid public key type");
     }
 }
 
@@ -260,10 +290,10 @@ KeyFunctions<PublicKey>::getKeyValue(PublicKey& key)
 {
     switch (key.type())
     {
-    case SIGNER_KEY_TYPE_ED25519:
+    case PUBLIC_KEY_TYPE_ED25519:
         return key.ed25519();
     default:
-        throw std::invalid_argument("invalid public key type");
+        throw CryptoError("invalid public key type");
     }
 }
 
@@ -272,10 +302,10 @@ KeyFunctions<PublicKey>::getKeyValue(PublicKey const& key)
 {
     switch (key.type())
     {
-    case SIGNER_KEY_TYPE_ED25519:
+    case PUBLIC_KEY_TYPE_ED25519:
         return key.ed25519();
     default:
-        throw std::invalid_argument("invalid public key type");
+        throw CryptoError("invalid public key type");
     }
 }
 
@@ -283,6 +313,7 @@ bool
 PubKeyUtils::verifySig(PublicKey const& key, Signature const& signature,
                        ByteSlice const& bin)
 {
+    ZoneScoped;
     assert(key.type() == PUBLIC_KEY_TYPE_ED25519);
     if (signature.size() != 64)
     {
@@ -296,10 +327,14 @@ PubKeyUtils::verifySig(PublicKey const& key, Signature const& signature,
         if (gVerifySigCache.exists(cacheKey))
         {
             ++gVerifyCacheHit;
+            std::string hitStr("hit");
+            ZoneText(hitStr.c_str(), hitStr.size());
             return gVerifySigCache.get(cacheKey);
         }
     }
 
+    std::string missStr("miss");
+    ZoneText(missStr.c_str(), missStr.size());
     ++gVerifyCacheMiss;
     bool ok =
         (crypto_sign_verify_detached(signature.data(), bin.data(), bin.size(),

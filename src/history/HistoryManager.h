@@ -48,17 +48,23 @@
  * number and most recent bucket hashes). As per RFC 5785, this checkpoint is
  * stored at .well-known/stellar-history.json as a JSON file.
  *
- * Checkpoints are made every 64 ledgers, which (at 5s ledger close time) is
- * 320s or about 5m20s. There will be 11 checkpoints per hour, 270 per day, and
- * 98,550 per year. Counting checkpoints within a 32bit value gives 43,581 years
- * of service for the system.
+ * Checkpoints are made "every 64 ledgers", when LCL is one-less-than a multiple
+ * of 64. In other words, at LCL=63, 127, 191, 255, etc. or in other other words
+ * checkpoint K covers the inclusive ledger range [K*64, ((K+1)*64)-1], and each
+ * of those ranges should contain exactly 64 ledgers, with the exception of the
+ * first checkpoint, which has only 63 ledgers: there is no ledger 0.
+ *
+ * Checkpointing every 64 ledgers means (at 5s ledger close time) each
+ * checkpoint happens every 320s, or about 5m20s. There will be 11 checkpoints
+ * per hour, 270 per day, and 98,550 per year. Counting checkpoints within a
+ * 32bit value gives 43,581 years of service for the system.
  *
  * While the _most recent_ checkpoint is in .well-known/stellar-history.json,
  * each checkpoint is also stored permanently at a path whose name includes the
  * last ledger number in the checkpoint (as a 32-bit hex string) and stored in a
- * 3-level deep directory tree of hex digit prefixes. For example, checkpoint at
- * current ledger-number 0x12345678 will write ledgers up to and including
- * ledger 0x12345677 and be described by file
+ * 3-level deep directory tree of hex digit prefixes.
+ *
+ * For example, checkpoint made with LCL=0x12345677 will be described by file
  * history/12/34/56/history-0x12345677.json and the associated history block
  * will be written to the two files ledger/12/34/56/ledger-0x12345677.xdr.gz and
  * transaction/12/34/56/transaction-0x12345677.xdr.gz
@@ -70,10 +76,9 @@
  * bucket/AA/BB/CC/bucket-<AABBCCDEFG...>.xdr.gz
  *
  * The first ledger and transaction files (containing the genesis ledger #1, and
- * the subsequent 62 ledgers) are checkpointed when LedgerManager's
- * currentLedger is 64 = 0x40, so the last ledger published into that snapshot
- * is 0x3f, and it's stored in files ledger/00/00/00/ledger-0x0000003f.xdr.gz
- * and transaction/00/00/00/transaction-0x0000003f.xdr.gz, and described by
+ * the subsequent 62 ledgers) are checkpointed at LCL 63 (a.k.a. 0x3f), and it's
+ * stored in files ledger/00/00/00/ledger-0x0000003f.xdr.gz and
+ * transaction/00/00/00/transaction-0x0000003f.xdr.gz, and described by
  * history/00/00/00/history-0x0000003f.json.
  *
  * A pseudo-checkpoint describing the system-state before any transactions are
@@ -186,20 +191,15 @@ class HistoryManager
   public:
     // Status code returned from LedgerManager::verifyCatchupCandidate. Look
     // there for additional documentation.
-    enum VerifyHashStatus
+    enum LedgerVerificationStatus
     {
-        VERIFY_HASH_OK,
-        VERIFY_HASH_BAD
+        VERIFY_STATUS_OK,
+        VERIFY_STATUS_ERR_BAD_HASH,
+        VERIFY_STATUS_ERR_BAD_LEDGER_VERSION,
+        VERIFY_STATUS_ERR_OVERSHOT,
+        VERIFY_STATUS_ERR_UNDERSHOT,
+        VERIFY_STATUS_ERR_MISSING_ENTRIES
     };
-
-    // Select any readable history archive. If there are more than one,
-    // select one at random.
-    virtual std::shared_ptr<HistoryArchive>
-    selectRandomReadableHistoryArchive() = 0;
-
-    // Initialize a named history archive by writing
-    // .well-known/stellar-history.json to it.
-    static bool initializeHistoryArchive(Application& app, std::string arch);
 
     // Check that config settings are at least somewhat reasonable.
     static bool checkSensibleConfig(Config const& cfg);
@@ -217,27 +217,87 @@ class HistoryManager
     // Return checkpoint that contains given ledger. Checkpoint is identified
     // by last ledger in range. This does not consult the network nor take
     // account of manual checkpoints.
-    virtual uint32_t checkpointContainingLedger(uint32_t ledger) const = 0;
+    uint32_t
+    checkpointContainingLedger(uint32_t ledger) const
+    {
+        uint32_t freq = getCheckpointFrequency();
+        // Round-up to next multiple of freq, then subtract 1 since checkpoints
+        // are numbered for (and cover ledgers up to) the last ledger in them,
+        // which is one-before the next multiple of freq.
+        return (((ledger / freq) + 1) * freq) - 1;
+    }
 
-    // Given a "current ledger" (not LCL) for a node, return the "current
-    // ledger" value at which the previous scheduled checkpoint should have
-    // occurred, by rounding-down to the next multiple of checkpoint
-    // frequency. This does not consult the network nor take account of manual
-    // checkpoints.
-    virtual uint32_t prevCheckpointLedger(uint32_t ledger) const = 0;
+    // Return true iff closing `ledger` should cause publishing a checkpoint.
+    // Equivalent to `ledger == checkpointContainingLedger(ledger)` but a little
+    // more obviously named.
+    bool
+    publishCheckpointOnLedgerClose(uint32_t ledger) const
+    {
+        return checkpointContainingLedger(ledger) == ledger;
+    }
 
-    // Given a "current ledger" (not LCL) for a node, return the "current
-    // ledger" value at which the next checkpoint should occur; usually this
-    // returns the next scheduled checkpoint by rounding-up to the next
-    // multiple of checkpoint frequency, but when catching up to a manual
-    // checkpoint it will return the ledger passed in, indicating that the
-    // "next" checkpoint-ledger to look forward to is the same as the "init"
-    // ledger of the catchup operation.
-    virtual uint32_t nextCheckpointLedger(uint32_t ledger) const = 0;
+    bool
+    isFirstLedgerInCheckpoint(uint32_t ledger) const
+    {
+        return firstLedgerInCheckpointContaining(ledger) == ledger;
+    }
 
-    // Given a ledger, tell the number of seconds to sleep until the next
-    // catchup probe.
-    virtual uint64_t nextCheckpointCatchupProbe(uint32_t ledger) const = 0;
+    bool
+    isLastLedgerInCheckpoint(uint32_t ledger) const
+    {
+        return checkpointContainingLedger(ledger) == ledger;
+    }
+
+    // Return the number of ledgers in the checkpoint containing a given ledger.
+    uint32_t
+    sizeOfCheckpointContaining(uint32_t ledger) const
+    {
+        uint32_t freq = getCheckpointFrequency();
+        if (ledger < freq)
+        {
+            return freq - 1;
+        }
+        return freq;
+    }
+
+    // Return the first ledger in the checkpoint containing a given ledger.
+    uint32_t
+    firstLedgerInCheckpointContaining(uint32_t ledger) const
+    {
+        uint32_t last = checkpointContainingLedger(ledger); // == 63, 127, 191
+        uint32_t size = sizeOfCheckpointContaining(ledger); // == 63, 64, 64
+        return last - (size - 1);                           // == 1, 64, 128
+    }
+
+    // Return the first ledger after the checkpoint containing a given ledger.
+    uint32_t
+    firstLedgerAfterCheckpointContaining(uint32_t ledger) const
+    {
+        uint32_t first =
+            firstLedgerInCheckpointContaining(ledger);      // == 1, 64, 128
+        uint32_t size = sizeOfCheckpointContaining(ledger); // == 63, 64, 64
+        return first + size;                                // == 64, 128, 192
+    }
+
+    // Return the last ledger before the checkpoint containing a given ledger,
+    // or zero if `ledger` is contained inside the first checkpoint.
+    uint32_t
+    lastLedgerBeforeCheckpointContaining(uint32_t ledger) const
+    {
+        uint32_t last = checkpointContainingLedger(ledger); // == 63, 127, 191
+        uint32_t size = sizeOfCheckpointContaining(ledger); // == 63, 64, 64
+        assert(last >= size);
+        return last - size; // == 0, 63, 127
+    }
+
+    // Return the ledger to trigger the catchup machinery on, given a ledger
+    // that is the start of a checkpoint buffered in the catchup manager.
+    uint32_t
+    ledgerToTriggerCatchup(uint32_t firstLedgerOfBufferedCheckpoint)
+    {
+        assert(isFirstLedgerInCheckpoint(firstLedgerOfBufferedCheckpoint));
+        return firstLedgerOfBufferedCheckpoint + 1;
+    }
 
     // Emit a log message and set StatusManager HISTORY_PUBLISH status to
     // describe current publish state.
@@ -257,10 +317,6 @@ class HistoryManager
     // publication-queue in the database. This should be followed shortly
     // (typically after commit) with a call to publishQueuedHistory.
     virtual void queueCurrentHistory() = 0;
-
-    // Returns whether or not the HistoryManager has any writable history
-    // archives (those configured with both a `get` and `put` command).
-    virtual bool hasAnyWritableHistoryArchive() = 0;
 
     // Return the youngest ledger still in the outgoing publish queue;
     // returns 0 if the publish queue has nothing in it.
@@ -284,6 +340,10 @@ class HistoryManager
     // queue.
     virtual std::vector<std::string> getBucketsReferencedByPublishQueue() = 0;
 
+    // Return the full set of HistoryArchiveStates in the persistent (DB)
+    // publish queue.
+    virtual std::vector<HistoryArchiveState> getPublishQueueStates() = 0;
+
     // Callback from Publication, indicates that a given snapshot was
     // published. The `success` parameter indicates whether _all_ the
     // configured archives published correctly; if so the snapshot
@@ -294,15 +354,8 @@ class HistoryManager
                      std::vector<std::string> const& originalBuckets,
                      bool success) = 0;
 
-    virtual void downloadMissingBuckets(
-        HistoryArchiveState desiredState,
-        std::function<void(asio::error_code const& ec)> handler) = 0;
-
-    // Return the HistoryArchiveState of the LedgerManager's LCL
-    virtual HistoryArchiveState getLastClosedHistoryArchiveState() const = 0;
-
     // Infer a quorum set by reading SCP messages in history archives.
-    virtual InferredQuorum inferQuorum() = 0;
+    virtual InferredQuorum inferQuorum(uint32_t ledgerNum) = 0;
 
     // Return the name of the HistoryManager's tmpdir (used for storing files in
     // transit).
@@ -312,30 +365,22 @@ class HistoryManager
     // tmpdir.
     virtual std::string localFilename(std::string const& basename) = 0;
 
-    // Return the number of checkpoints that have been skipped due to
-    // unavailability of any publish targets.
-    virtual uint64_t getPublishSkipCount() = 0;
-
     // Return the number of checkpoints that have been enqueued for
     // publication. This may be less than the number "started", but every
     // enqueued checkpoint should eventually start.
-    virtual uint64_t getPublishQueueCount() = 0;
-
-    // Return the number of enqueued checkpoints that have been delayed due to
-    // the publish system being busy with a previous checkpoint. This indicates
-    // a degree of overloading in the publish system.
-    virtual uint64_t getPublishDelayCount() = 0;
-
-    // Return the number of enqueued checkpoints that have "started", meaning
-    // that their history logs have been written to disk and the publish system
-    // has commenced running the external put commands for them.
-    virtual uint64_t getPublishStartCount() = 0;
+    virtual uint64_t getPublishQueueCount() const = 0;
 
     // Return the number of checkpoints that completed publication successfully.
-    virtual uint64_t getPublishSuccessCount() = 0;
+    virtual uint64_t getPublishSuccessCount() const = 0;
 
     // Return the number of checkpoints that failed publication.
-    virtual uint64_t getPublishFailureCount() = 0;
+    virtual uint64_t getPublishFailureCount() const = 0;
+
+#ifdef BUILD_TESTS
+    // Enable or disable history publication, purely a testing interface.
+    // History is still queued when publication is disabled.
+    virtual void setPublicationEnabled(bool enabled) = 0;
+#endif
 
     virtual ~HistoryManager(){};
 };

@@ -12,17 +12,13 @@
 #include "history/FileTransferInfo.h"
 #include "history/HistoryArchive.h"
 #include "history/HistoryManager.h"
-#include "ledger/LedgerHeaderFrame.h"
+#include "ledger/LedgerHeaderUtils.h"
 #include "main/Application.h"
 #include "main/Config.h"
-#include "transactions/TransactionFrame.h"
+#include "transactions/TransactionSQL.h"
 #include "util/Logging.h"
-#include "util/SociNoWarnings.h"
 #include "util/XDRStream.h"
-#include "util/make_unique.h"
-
-#include "medida/counter.h"
-#include "medida/metrics_registry.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
@@ -44,28 +40,19 @@ StateSnapshot::StateSnapshot(Application& app, HistoryArchiveState const& state)
           mSnapDir, HISTORY_FILE_TYPE_SCP, mLocalState.currentLedger))
 
 {
-    makeLive();
-}
-
-void
-StateSnapshot::makeLive()
-{
-    for (auto i = 0; i < mLocalState.currentBuckets.size(); i++)
+    if (mLocalState.currentBuckets.size() != BucketList::kNumLevels)
     {
-        auto& hb = mLocalState.currentBuckets[i];
-        if (hb.next.hasHashes() && !hb.next.isLive())
-        {
-            hb.next.makeLive(mApp, BucketList::keepDeadEntries(i));
-        }
+        throw std::runtime_error("Invalid HAS: malformed bucketlist");
     }
 }
 
 bool
 StateSnapshot::writeHistoryBlocks() const
 {
+    ZoneScoped;
     std::unique_ptr<soci::session> snapSess(
         mApp.getDatabase().canUsePool()
-            ? make_unique<soci::session>(mApp.getDatabase().getPool())
+            ? std::make_unique<soci::session>(mApp.getDatabase().getPool())
             : nullptr);
     soci::session& sess(snapSess ? *snapSess : mApp.getDatabase().getSession());
     soci::transaction tx(sess);
@@ -79,29 +66,26 @@ StateSnapshot::writeHistoryBlocks() const
     uint32_t begin, count;
     size_t nHeaders;
     {
-        XDROutputFileStream ledgerOut, txOut, txResultOut, scpHistory;
+        bool doFsync = !mApp.getConfig().DISABLE_XDR_FSYNC;
+        asio::io_context& ctx = mApp.getClock().getIOContext();
+        XDROutputFileStream ledgerOut(ctx, doFsync), txOut(ctx, doFsync),
+            txResultOut(ctx, doFsync), scpHistory(ctx, doFsync);
         ledgerOut.open(mLedgerSnapFile->localPath_nogz());
         txOut.open(mTransactionSnapFile->localPath_nogz());
         txResultOut.open(mTransactionResultSnapFile->localPath_nogz());
         scpHistory.open(mSCPHistorySnapFile->localPath_nogz());
 
-        // 'mLocalState' describes the LCL, so its currentLedger will usually be
-        // 63,
-        // 127, 191, etc. We want to start our snapshot at 64-before the _next_
-        // ledger: 0, 64, 128, etc. In cases where we're forcibly checkpointed
-        // early, we still want to round-down to the previous checkpoint ledger.
-        begin = mApp.getHistoryManager().prevCheckpointLedger(
-            mLocalState.currentLedger);
-
-        count = (mLocalState.currentLedger - begin) + 1;
+        auto& hm = mApp.getHistoryManager();
+        begin = hm.firstLedgerInCheckpointContaining(mLocalState.currentLedger);
+        count = hm.sizeOfCheckpointContaining(mLocalState.currentLedger);
         CLOG(DEBUG, "History") << "Streaming " << count
                                << " ledgers worth of history, from " << begin;
 
-        nHeaders = LedgerHeaderFrame::copyLedgerHeadersToStream(
-            mApp.getDatabase(), sess, begin, count, ledgerOut);
-        size_t nTxs = TransactionFrame::copyTransactionsToStream(
-            mApp.getNetworkID(), mApp.getDatabase(), sess, begin, count, txOut,
-            txResultOut);
+        nHeaders = LedgerHeaderUtils::copyToStream(mApp.getDatabase(), sess,
+                                                   begin, count, ledgerOut);
+        size_t nTxs =
+            copyTransactionsToStream(mApp.getNetworkID(), mApp.getDatabase(),
+                                     sess, begin, count, txOut, txResultOut);
         CLOG(DEBUG, "History") << "Wrote " << nHeaders << " ledger headers to "
                                << mLedgerSnapFile->localPath_nogz();
         CLOG(DEBUG, "History")
@@ -133,7 +117,7 @@ StateSnapshot::writeHistoryBlocks() const
     // transaction-isolation level -- the highest offered! -- as txns only have
     // to be applied in isolation and in _some_ order, not the wall-clock order
     // we issued them. Anyway this is transient and should go away upon retry.
-    if (!((begin == 0 && nHeaders == count - 1) || nHeaders == count))
+    if (nHeaders != count)
     {
         CLOG(WARNING, "History")
             << "Only wrote " << nHeaders << " ledger headers for "
@@ -143,5 +127,32 @@ StateSnapshot::writeHistoryBlocks() const
     }
 
     return true;
+}
+
+std::vector<std::shared_ptr<FileTransferInfo>>
+StateSnapshot::differingHASFiles(HistoryArchiveState const& other)
+{
+    ZoneScoped;
+    std::vector<std::shared_ptr<FileTransferInfo>> files{};
+    auto addIfExists = [&](std::shared_ptr<FileTransferInfo> const& f) {
+        if (f && fs::exists(f->localPath_nogz()))
+        {
+            files.push_back(f);
+        }
+    };
+
+    addIfExists(mLedgerSnapFile);
+    addIfExists(mTransactionSnapFile);
+    addIfExists(mTransactionResultSnapFile);
+    addIfExists(mSCPHistorySnapFile);
+
+    for (auto const& hash : mLocalState.differingBuckets(other))
+    {
+        auto b = mApp.getBucketManager().getBucketByHash(hexToBin256(hash));
+        assert(b);
+        addIfExists(std::make_shared<FileTransferInfo>(*b));
+    }
+
+    return files;
 }
 }

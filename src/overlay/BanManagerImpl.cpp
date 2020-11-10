@@ -8,7 +8,7 @@
 #include "database/Database.h"
 #include "main/Application.h"
 #include "util/Logging.h"
-#include "util/make_unique.h"
+#include <Tracy.hpp>
 
 namespace stellar
 {
@@ -18,7 +18,7 @@ using namespace std;
 std::unique_ptr<BanManager>
 BanManager::create(Application& app)
 {
-    return make_unique<BanManagerImpl>(app);
+    return std::make_unique<BanManagerImpl>(app);
 }
 
 BanManagerImpl::BanManagerImpl(Application& app) : mApp(app)
@@ -32,11 +32,19 @@ BanManagerImpl::~BanManagerImpl()
 void
 BanManagerImpl::banNode(NodeID nodeID)
 {
+    ZoneScoped;
+    if (isBanned(nodeID))
+    {
+        return;
+    }
+
     auto nodeIDString = KeyUtils::toStrKey(nodeID);
+
+    CLOG(INFO, "Overlay") << "ban " << nodeIDString;
+
     auto timer = mApp.getDatabase().getInsertTimer("ban");
     auto prep = mApp.getDatabase().getPreparedStatement(
-        "INSERT INTO ban (nodeid) "
-        "SELECT :n WHERE NOT EXISTS (SELECT 1 FROM ban WHERE nodeid = :n)");
+        "INSERT INTO ban (nodeid) VALUES(:n)");
     auto& st = prep.statement();
     st.exchange(soci::use(nodeIDString));
     st.define_and_bind();
@@ -46,7 +54,9 @@ BanManagerImpl::banNode(NodeID nodeID)
 void
 BanManagerImpl::unbanNode(NodeID nodeID)
 {
+    ZoneScoped;
     auto nodeIDString = KeyUtils::toStrKey(nodeID);
+    CLOG(INFO, "Overlay") << "unban " << nodeIDString;
     auto timer = mApp.getDatabase().getDeleteTimer("ban");
     auto prep = mApp.getDatabase().getPreparedStatement(
         "DELETE FROM ban WHERE nodeid = :n;");
@@ -59,6 +69,7 @@ BanManagerImpl::unbanNode(NodeID nodeID)
 bool
 BanManagerImpl::isBanned(NodeID nodeID)
 {
+    ZoneScoped;
     auto nodeIDString = KeyUtils::toStrKey(nodeID);
     auto timer = mApp.getDatabase().getSelectTimer("ban");
     auto prep = mApp.getDatabase().getPreparedStatement(
@@ -75,6 +86,7 @@ BanManagerImpl::isBanned(NodeID nodeID)
 std::vector<std::string>
 BanManagerImpl::getBans()
 {
+    ZoneScoped;
     std::vector<std::string> result;
     std::string nodeIDString;
     auto timer = mApp.getDatabase().getSelectTimer("ban");

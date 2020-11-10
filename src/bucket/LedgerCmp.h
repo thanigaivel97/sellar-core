@@ -4,12 +4,33 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "ledger/EntryFrame.h"
 #include "overlay/StellarXDR.h"
+#include "util/XDROperators.h"
 
 namespace stellar
 {
-using xdr::operator<;
+
+template <typename T>
+bool
+lexCompare(T&& lhs1, T&& rhs1)
+{
+    return lhs1 < rhs1;
+}
+
+template <typename T, typename... U>
+bool
+lexCompare(T&& lhs1, T&& rhs1, U&&... args)
+{
+    if (lhs1 < rhs1)
+    {
+        return true;
+    }
+    else if (rhs1 < lhs1)
+    {
+        return false;
+    }
+    return lexCompare(std::forward<U>(args)...);
+}
 
 /**
  * Compare two LedgerEntries or LedgerKeys for 'identity', not content.
@@ -44,45 +65,20 @@ struct LedgerEntryIdCmp
 
         switch (aty)
         {
-
         case ACCOUNT:
             return a.account().accountID < b.account().accountID;
-
         case TRUSTLINE:
-        {
-            auto const& atl = a.trustLine();
-            auto const& btl = b.trustLine();
-            if (atl.accountID < btl.accountID)
-                return true;
-            if (btl.accountID < atl.accountID)
-                return false;
-            {
-                return atl.asset < btl.asset;
-            }
-        }
-
+            return lexCompare(a.trustLine().accountID, b.trustLine().accountID,
+                              a.trustLine().asset, b.trustLine().asset);
         case OFFER:
-        {
-            auto const& aof = a.offer();
-            auto const& bof = b.offer();
-            if (aof.sellerID < bof.sellerID)
-                return true;
-            if (bof.sellerID < aof.sellerID)
-                return false;
-            return aof.offerID < bof.offerID;
-        }
+            return lexCompare(a.offer().sellerID, b.offer().sellerID,
+                              a.offer().offerID, b.offer().offerID);
         case DATA:
-        {
-            auto const& ad = a.data();
-            auto const& bd = b.data();
-            if (ad.accountID < bd.accountID)
-                return true;
-            if (bd.accountID < ad.accountID)
-                return false;
-            {
-                return ad.dataName < bd.dataName;
-            }
-        }
+            return lexCompare(a.data().accountID, b.data().accountID,
+                              a.data().dataName, b.data().dataName);
+        case CLAIMABLE_BALANCE:
+            return a.claimableBalance().balanceID <
+                   b.claimableBalance().balanceID;
         }
         return false;
     }
@@ -101,26 +97,47 @@ struct BucketEntryIdCmp
         BucketEntryType aty = a.type();
         BucketEntryType bty = b.type();
 
-        if (aty == LIVEENTRY)
+        // METAENTRY sorts below all other entries, comes first in buckets.
+        if (aty == METAENTRY || bty == METAENTRY)
         {
-            if (bty == LIVEENTRY)
+            return aty < bty;
+        }
+
+        if (aty == LIVEENTRY || aty == INITENTRY)
+        {
+            if (bty == LIVEENTRY || bty == INITENTRY)
             {
                 return LedgerEntryIdCmp{}(a.liveEntry().data,
                                           b.liveEntry().data);
             }
             else
             {
+                if (bty != DEADENTRY)
+                {
+                    throw std::runtime_error("Malformed bucket: unexpected "
+                                             "non-INIT/LIVE/DEAD entry.");
+                }
                 return LedgerEntryIdCmp{}(a.liveEntry().data, b.deadEntry());
             }
         }
         else
         {
-            if (bty == LIVEENTRY)
+            if (aty != DEADENTRY)
+            {
+                throw std::runtime_error(
+                    "Malformed bucket: unexpected non-INIT/LIVE/DEAD entry.");
+            }
+            if (bty == LIVEENTRY || bty == INITENTRY)
             {
                 return LedgerEntryIdCmp{}(a.deadEntry(), b.liveEntry().data);
             }
             else
             {
+                if (bty != DEADENTRY)
+                {
+                    throw std::runtime_error("Malformed bucket: unexpected "
+                                             "non-INIT/LIVE/DEAD entry.");
+                }
                 return LedgerEntryIdCmp{}(a.deadEntry(), b.deadEntry());
             }
         }

@@ -7,6 +7,7 @@
 #include "bucket/PublishQueueBuckets.h"
 #include "history/HistoryManager.h"
 #include "util/TmpDir.h"
+#include "work/Work.h"
 #include <memory>
 
 namespace medida
@@ -24,31 +25,29 @@ class HistoryManagerImpl : public HistoryManager
 {
     Application& mApp;
     std::unique_ptr<TmpDir> mWorkDir;
-    std::shared_ptr<Work> mPublishWork;
+    std::shared_ptr<BasicWork> mPublishWork;
+
     PublishQueueBuckets mPublishQueueBuckets;
     bool mPublishQueueBucketsFilled{false};
 
-    medida::Meter& mPublishSkip;
-    medida::Meter& mPublishQueue;
-    medida::Meter& mPublishDelay;
-    medida::Meter& mPublishStart;
+    int mPublishQueued{0};
     medida::Meter& mPublishSuccess;
     medida::Meter& mPublishFailure;
 
-    std::vector<std::string> loadBucketsReferencedByPublishQueue();
+    medida::Timer& mEnqueueToPublishTimer;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point>
+        mEnqueueTimes;
+
+    PublishQueueBuckets::BucketCount loadBucketsReferencedByPublishQueue();
+#ifdef BUILD_TESTS
+    bool mPublicationEnabled{true};
+#endif
 
   public:
     HistoryManagerImpl(Application& app);
     ~HistoryManagerImpl() override;
 
-    std::shared_ptr<HistoryArchive>
-    selectRandomReadableHistoryArchive() override;
-
     uint32_t getCheckpointFrequency() const override;
-    uint32_t checkpointContainingLedger(uint32_t ledger) const override;
-    uint32_t prevCheckpointLedger(uint32_t ledger) const override;
-    uint32_t nextCheckpointLedger(uint32_t ledger) const override;
-    uint64_t nextCheckpointCatchupProbe(uint32_t ledger) const override;
 
     void logAndUpdatePublishStatus() override;
 
@@ -59,8 +58,6 @@ class HistoryManagerImpl : public HistoryManager
     void queueCurrentHistory() override;
 
     void takeSnapshotAndPublish(HistoryArchiveState const& has);
-
-    bool hasAnyWritableHistoryArchive() override;
 
     uint32_t getMinLedgerQueuedToPublish() override;
 
@@ -73,29 +70,24 @@ class HistoryManagerImpl : public HistoryManager
 
     std::vector<std::string> getBucketsReferencedByPublishQueue() override;
 
-    std::vector<HistoryArchiveState> getPublishQueueStates();
+    std::vector<HistoryArchiveState> getPublishQueueStates() override;
 
     void historyPublished(uint32_t ledgerSeq,
                           std::vector<std::string> const& originalBuckets,
                           bool success) override;
 
-    void downloadMissingBuckets(
-        HistoryArchiveState desiredState,
-        std::function<void(asio::error_code const& ec)> handler) override;
-
-    HistoryArchiveState getLastClosedHistoryArchiveState() const override;
-
-    InferredQuorum inferQuorum() override;
+    InferredQuorum inferQuorum(uint32_t ledgerNum) override;
 
     std::string const& getTmpDir() override;
 
     std::string localFilename(std::string const& basename) override;
 
-    uint64_t getPublishSkipCount() override;
-    uint64_t getPublishQueueCount() override;
-    uint64_t getPublishDelayCount() override;
-    uint64_t getPublishStartCount() override;
-    uint64_t getPublishSuccessCount() override;
-    uint64_t getPublishFailureCount() override;
+    uint64_t getPublishQueueCount() const override;
+    uint64_t getPublishSuccessCount() const override;
+    uint64_t getPublishFailureCount() const override;
+
+#ifdef BUILD_TESTS
+    void setPublicationEnabled(bool enabled) override;
+#endif
 };
 }

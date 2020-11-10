@@ -4,30 +4,41 @@
 
 #include "historywork/PutRemoteFileWork.h"
 #include "history/HistoryArchive.h"
+#include "main/Application.h"
 
 namespace stellar
 {
-
-PutRemoteFileWork::PutRemoteFileWork(
-    Application& app, WorkParent& parent, std::string const& local,
-    std::string const& remote, std::shared_ptr<HistoryArchive const> archive)
-    : RunCommandWork(app, parent, std::string("put-remote-file ") + remote)
-    , mRemote(remote)
+PutRemoteFileWork::PutRemoteFileWork(Application& app, std::string const& local,
+                                     std::string const& remote,
+                                     std::shared_ptr<HistoryArchive> archive)
+    : RunCommandWork(app, std::string("put-remote-file ") + remote,
+                     BasicWork::RETRY_A_LOT)
     , mLocal(local)
+    , mRemote(remote)
     , mArchive(archive)
 {
     assert(mArchive);
     assert(mArchive->hasPutCmd());
 }
 
-PutRemoteFileWork::~PutRemoteFileWork()
+CommandInfo
+PutRemoteFileWork::getCommand()
 {
-    clearChildren();
+    auto cmdLine = mArchive->putFileCmd(mLocal, mRemote);
+    return CommandInfo{cmdLine, std::string()};
 }
 
 void
-PutRemoteFileWork::getCommand(std::string& cmdLine, std::string& outFile)
+PutRemoteFileWork::onSuccess()
 {
-    cmdLine = mArchive->putFileCmd(mLocal, mRemote);
+    mArchive->markSuccess();
+    RunCommandWork::onSuccess();
+}
+
+void
+PutRemoteFileWork::onFailureRaise()
+{
+    mArchive->markFailure();
+    RunCommandWork::onFailureRaise();
 }
 }

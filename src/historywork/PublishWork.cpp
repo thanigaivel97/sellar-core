@@ -3,109 +3,47 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "historywork/PublishWork.h"
+#include "history/HistoryArchiveManager.h"
 #include "history/HistoryManager.h"
 #include "history/StateSnapshot.h"
-#include "historywork/PutSnapshotFilesWork.h"
-#include "historywork/ResolveSnapshotWork.h"
-#include "historywork/WriteSnapshotWork.h"
-#include "lib/util/format.h"
 #include "main/Application.h"
 #include "util/Logging.h"
+#include <Tracy.hpp>
+#include <fmt/format.h>
 
 namespace stellar
 {
 
-PublishWork::PublishWork(Application& app, WorkParent& parent,
-                         std::shared_ptr<StateSnapshot> snapshot)
-    : Work(app, parent,
-           fmt::format("publish-{:08x}", snapshot->mLocalState.currentLedger))
+PublishWork::PublishWork(Application& app,
+                         std::shared_ptr<StateSnapshot> snapshot,
+                         std::vector<std::shared_ptr<BasicWork>> seq,
+                         std::vector<std::string> const& bucketHashes)
+    : WorkSequence(
+          app,
+          fmt::format("publish-{:08x}", snapshot->mLocalState.currentLedger),
+          seq, BasicWork::RETRY_NEVER)
     , mSnapshot(snapshot)
-    , mOriginalBuckets(mSnapshot->mLocalState.allBuckets())
+    , mOriginalBuckets(bucketHashes)
 {
-}
-
-PublishWork::~PublishWork()
-{
-    clearChildren();
-}
-
-std::string
-PublishWork::getStatus() const
-{
-    if (mState == WORK_PENDING)
-    {
-        if (mResolveSnapshotWork)
-        {
-            return mResolveSnapshotWork->getStatus();
-        }
-        else if (mWriteSnapshotWork)
-        {
-            return mWriteSnapshotWork->getStatus();
-        }
-        else if (mUpdateArchivesWork)
-        {
-            return mUpdateArchivesWork->getStatus();
-        }
-    }
-    return Work::getStatus();
-}
-
-void
-PublishWork::onReset()
-{
-    clearChildren();
-
-    mResolveSnapshotWork.reset();
-    mWriteSnapshotWork.reset();
-    mUpdateArchivesWork.reset();
-}
-
-Work::State
-PublishWork::onSuccess()
-{
-    // Phase 1: resolve futures in snapshot
-    if (!mResolveSnapshotWork)
-    {
-        mResolveSnapshotWork = addWork<ResolveSnapshotWork>(mSnapshot);
-        return WORK_PENDING;
-    }
-
-    // Phase 2: write snapshot files
-    if (!mWriteSnapshotWork)
-    {
-        mWriteSnapshotWork = addWork<WriteSnapshotWork>(mSnapshot);
-        return WORK_PENDING;
-    }
-
-    // Phase 3: update archives
-    if (!mUpdateArchivesWork)
-    {
-        mUpdateArchivesWork = addWork<Work>("update-archives");
-        for (auto& aPair : mApp.getConfig().HISTORY)
-        {
-            auto arch = aPair.second;
-            if (!arch->hasPutCmd())
-            {
-                continue;
-            }
-            mUpdateArchivesWork->addWork<PutSnapshotFilesWork>(arch, mSnapshot);
-        }
-        return WORK_PENDING;
-    }
-
-    // use mOriginalBuckets as mSnapshot->mLocalState.allBuckets() could change
-    // in meantime
-    mApp.getHistoryManager().historyPublished(
-        mSnapshot->mLocalState.currentLedger, mOriginalBuckets, true);
-    return WORK_SUCCESS;
 }
 
 void
 PublishWork::onFailureRaise()
 {
+    ZoneScoped;
     // use mOriginalBuckets as mSnapshot->mLocalState.allBuckets() could change
     // in meantime
     mApp.getHistoryManager().historyPublished(
         mSnapshot->mLocalState.currentLedger, mOriginalBuckets, false);
+}
+
+void
+PublishWork::onSuccess()
+{
+    ZoneScoped;
+    // use mOriginalBuckets as mSnapshot->mLocalState.allBuckets() could change
+    // in meantime
+    mApp.getHistoryManager().historyPublished(
+        mSnapshot->mLocalState.currentLedger, mOriginalBuckets, true);
 }
 }

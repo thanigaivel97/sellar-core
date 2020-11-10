@@ -6,7 +6,10 @@
 
 #include "TxSetFrame.h"
 #include "Upgrades.h"
+#include "herder/QuorumTracker.h"
+#include "herder/TransactionQueue.h"
 #include "lib/json/json-forwards.h"
+#include "overlay/Peer.h"
 #include "overlay/StellarXDR.h"
 #include "scp/SCP.h"
 #include "util/Timer.h"
@@ -17,10 +20,7 @@
 namespace stellar
 {
 class Application;
-class Peer;
 class XDROutputFileStream;
-
-typedef std::shared_ptr<Peer> PeerPtr;
 
 /*
  * Public Interface to the Herder module
@@ -43,8 +43,12 @@ class Herder
     // timeout before considering the node out of sync
     static std::chrono::seconds const CONSENSUS_STUCK_TIMEOUT_SECONDS;
 
+    // timeout before triggering out of sync recovery
+    static std::chrono::seconds const OUT_OF_SYNC_RECOVERY_TIMER;
+
     // Maximum time slip between nodes.
-    static std::chrono::seconds const MAX_TIME_SLIP_SECONDS;
+    static std::chrono::seconds constexpr MAX_TIME_SLIP_SECONDS =
+        std::chrono::seconds{60};
 
     // How many seconds of inactivity before evicting a node.
     static std::chrono::seconds const NODE_EXPIRATION_SECONDS;
@@ -52,10 +56,14 @@ class Herder
     // How many ledger in the future we consider an envelope viable.
     static uint32 const LEDGER_VALIDITY_BRACKET;
 
-    // How many ledgers in the past we keep track of
-    static uint32 const MAX_SLOTS_TO_REMEMBER;
+    // Threshold used to filter out irrelevant events.
+    static std::chrono::nanoseconds const TIMERS_THRESHOLD_NANOSEC;
 
     static std::unique_ptr<Herder> create(Application& app);
+
+    // number of additional ledgers we retrieve from peers before our own lcl,
+    // this is to help recover potential missing SCP messages for other nodes
+    static uint32 const SCP_EXTRA_LOOKBACK_LEDGERS;
 
     enum State
     {
@@ -64,26 +72,21 @@ class Herder
         HERDER_NUM_STATE
     };
 
-    enum TransactionSubmitStatus
-    {
-        TX_STATUS_PENDING = 0,
-        TX_STATUS_DUPLICATE,
-        TX_STATUS_ERROR,
-        TX_STATUS_COUNT
-    };
-
     enum EnvelopeStatus
     {
-        // for some reason this envelope was discarded - either is was invalid,
+        // for some reason this envelope was discarded - either it was invalid,
         // used unsane qset or was coming from node that is not in quorum
-        ENVELOPE_STATUS_DISCARDED,
+        ENVELOPE_STATUS_DISCARDED = -100,
+        // envelope was skipped as it's from this validator
+        ENVELOPE_STATUS_SKIPPED_SELF = -10,
+        // envelope was already processed
+        ENVELOPE_STATUS_PROCESSED = -1,
+
         // envelope data is currently being fetched
-        ENVELOPE_STATUS_FETCHING,
+        ENVELOPE_STATUS_FETCHING = 0,
         // current call to recvSCPEnvelope() was the first when the envelope
         // was fully fetched so it is ready for processing
-        ENVELOPE_STATUS_READY,
-        // envelope was already processed
-        ENVELOPE_STATUS_PROCESSED,
+        ENVELOPE_STATUS_READY = 1
     };
 
     virtual State getState() const = 0;
@@ -94,6 +97,7 @@ class Herder
     virtual void syncMetrics() = 0;
 
     virtual void bootstrap() = 0;
+    virtual void shutdown() = 0;
 
     // restores Herder's state from disk
     virtual void restoreState() = 0;
@@ -102,27 +106,38 @@ class Herder
                                   SCPQuorumSet const& qset) = 0;
     virtual bool recvTxSet(Hash const& hash, TxSetFrame const& txset) = 0;
     // We are learning about a new transaction.
-    virtual TransactionSubmitStatus recvTransaction(TransactionFramePtr tx) = 0;
+    virtual TransactionQueue::AddResult
+    recvTransaction(TransactionFrameBasePtr tx) = 0;
     virtual void peerDoesntHave(stellar::MessageType type,
-                                uint256 const& itemID, PeerPtr peer) = 0;
+                                uint256 const& itemID, Peer::pointer peer) = 0;
     virtual TxSetFramePtr getTxSet(Hash const& hash) = 0;
     virtual SCPQuorumSetPtr getQSet(Hash const& qSetHash) = 0;
 
     // We are learning about a new envelope.
     virtual EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope) = 0;
 
+    // We are learning about a new fully-fetched envelope.
+    virtual EnvelopeStatus recvSCPEnvelope(SCPEnvelope const& envelope,
+                                           const SCPQuorumSet& qset,
+                                           TxSetFrame txset) = 0;
+
     // a peer needs our SCP state
-    virtual void sendSCPStateToPeer(uint32 ledgerSeq, PeerPtr peer) = 0;
+    virtual void sendSCPStateToPeer(uint32 ledgerSeq, Peer::pointer peer) = 0;
 
     // returns the latest known ledger seq using consensus information
     // and local state
     virtual uint32_t getCurrentLedgerSeq() const = 0;
 
+    // return the smallest ledger number we need messages for when asking peers
+    virtual uint32 getMinLedgerSeqToAskPeers() const = 0;
+
     // Return the maximum sequence number for any tx (or 0 if none) from a given
     // sender in the pending or recent tx sets.
     virtual SequenceNumber getMaxSeqInPendingTxs(AccountID const&) = 0;
 
-    virtual void triggerNextLedger(uint32_t ledgerSeqToTrigger) = 0;
+    virtual void triggerNextLedger(uint32_t ledgerSeqToTrigger,
+                                   bool forceTrackingSCP) = 0;
+    virtual void setInSyncAndTriggerNextLedger() = 0;
 
     // lookup a nodeID in config and in SCP messages
     virtual bool resolveNodeID(std::string const& s, PublicKey& retKey) = 0;
@@ -132,12 +147,19 @@ class Herder
     // gets the upgrades that are scheduled by this node
     virtual std::string getUpgradesJson() = 0;
 
+    virtual void forceSCPStateIntoSyncWithLastClosedLedger() = 0;
+
     virtual ~Herder()
     {
     }
 
-    virtual void dumpInfo(Json::Value& ret, size_t limit) = 0;
-    virtual void dumpQuorumInfo(Json::Value& ret, NodeID const& id,
-                                bool summary, uint64 index = 0) = 0;
+    virtual Json::Value getJsonInfo(size_t limit, bool fullKeys = false) = 0;
+    virtual Json::Value getJsonQuorumInfo(NodeID const& id, bool summary,
+                                          bool fullKeys, uint64 index) = 0;
+    virtual Json::Value getJsonTransitiveQuorumInfo(NodeID const& id,
+                                                    bool summary,
+                                                    bool fullKeys) = 0;
+    virtual QuorumTracker::QuorumMap const&
+    getCurrentlyTrackedQuorum() const = 0;
 };
 }

@@ -2,46 +2,41 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "SCP.h"
-
-#include <algorithm>
-
+#include "scp/SCP.h"
 #include "crypto/Hex.h"
 #include "crypto/SHA.h"
 #include "scp/LocalNode.h"
 #include "scp/Slot.h"
 #include "util/GlobalChecks.h"
 #include "util/Logging.h"
+#include "util/XDROperators.h"
 #include "xdrpp/marshal.h"
+
+#include <algorithm>
+#include <lib/json/json.h>
+#include <sstream>
 
 namespace stellar
 {
-using xdr::operator==;
 
-SCP::SCP(SCPDriver& driver, SecretKey const& secretKey, bool isValidator,
+SCP::SCP(SCPDriver& driver, NodeID const& nodeID, bool isValidator,
          SCPQuorumSet const& qSetLocal)
     : mDriver(driver)
 {
     mLocalNode =
-        std::make_shared<LocalNode>(secretKey, isValidator, qSetLocal, this);
+        std::make_shared<LocalNode>(nodeID, isValidator, qSetLocal, this);
 }
 
 SCP::EnvelopeState
-SCP::receiveEnvelope(SCPEnvelope const& envelope)
+SCP::receiveEnvelope(SCPEnvelopeWrapperPtr envelope)
 {
-    // If the envelope is not correctly signed, we ignore it.
-    if (!mDriver.verifyEnvelope(envelope))
-    {
-        CLOG(DEBUG, "SCP") << "SCP::receiveEnvelope invalid";
-        return SCP::EnvelopeState::INVALID;
-    }
-
-    uint64 slotIndex = envelope.statement.slotIndex;
+    uint64 slotIndex = envelope->getStatement().slotIndex;
     return getSlot(slotIndex, true)->processEnvelope(envelope, false);
 }
 
 bool
-SCP::nominate(uint64 slotIndex, Value const& value, Value const& previousValue)
+SCP::nominate(uint64 slotIndex, ValueWrapperPtr value,
+              Value const& previousValue)
 {
     dbgAssert(isValidator());
     return getSlot(slotIndex, true)->nominate(value, previousValue, false);
@@ -79,16 +74,9 @@ void
 SCP::purgeSlots(uint64 maxSlotIndex)
 {
     auto it = mKnownSlots.begin();
-    while (it != mKnownSlots.end())
+    while (it != mKnownSlots.end() && it->first < maxSlotIndex)
     {
-        if (it->first < maxSlotIndex)
-        {
-            it = mKnownSlots.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
+        it = mKnownSlots.erase(it);
     }
 }
 
@@ -118,26 +106,33 @@ SCP::getSlot(uint64 slotIndex, bool create)
     return res;
 }
 
-void
-SCP::dumpInfo(Json::Value& ret, size_t limit)
+Json::Value
+SCP::getJsonInfo(size_t limit, bool fullKeys)
 {
+    Json::Value ret;
     auto it = mKnownSlots.rbegin();
     while (it != mKnownSlots.rend() && limit-- != 0)
     {
-        it->second->dumpInfo(ret);
+        auto& slot = *(it->second);
+        ret[std::to_string(slot.getSlotIndex())] = slot.getJsonInfo(fullKeys);
         it++;
     }
+
+    return ret;
 }
 
-void
-SCP::dumpQuorumInfo(Json::Value& ret, NodeID const& id, bool summary,
-                    uint64 index)
+Json::Value
+SCP::getJsonQuorumInfo(NodeID const& id, bool summary, bool fullKeys,
+                       uint64 index)
 {
+    Json::Value ret;
     if (index == 0)
     {
         for (auto& item : mKnownSlots)
         {
-            item.second->dumpQuorumInfo(ret, id, summary);
+            auto& slot = *item.second;
+            ret = slot.getJsonQuorumInfo(id, summary, fullKeys);
+            ret["ledger"] = static_cast<Json::UInt64>(slot.getSlotIndex());
         }
     }
     else
@@ -145,21 +140,45 @@ SCP::dumpQuorumInfo(Json::Value& ret, NodeID const& id, bool summary,
         auto s = getSlot(index, false);
         if (s)
         {
-            s->dumpQuorumInfo(ret, id, summary);
+            ret = s->getJsonQuorumInfo(id, summary, fullKeys);
+            ret["ledger"] = static_cast<Json::UInt64>(index);
         }
     }
-}
-
-SecretKey const&
-SCP::getSecretKey()
-{
-    return mLocalNode->getSecretKey();
+    return ret;
 }
 
 bool
 SCP::isValidator()
 {
     return mLocalNode->isValidator();
+}
+
+bool
+SCP::isSlotFullyValidated(uint64 slotIndex)
+{
+    auto slot = getSlot(slotIndex, false);
+    if (slot)
+    {
+        return slot->isFullyValidated();
+    }
+    else
+    {
+        return false;
+    }
+}
+
+bool
+SCP::gotVBlocking(uint64 slotIndex)
+{
+    auto slot = getSlot(slotIndex, false);
+    if (slot)
+    {
+        return slot->gotVBlocking();
+    }
+    else
+    {
+        return false;
+    }
 }
 
 size_t
@@ -194,13 +213,10 @@ SCP::getLatestMessagesSend(uint64 slotIndex)
 }
 
 void
-SCP::setStateFromEnvelope(uint64 slotIndex, SCPEnvelope const& e)
+SCP::setStateFromEnvelope(uint64 slotIndex, SCPEnvelopeWrapperPtr e)
 {
-    if (mDriver.verifyEnvelope(e))
-    {
-        auto slot = getSlot(slotIndex, true);
-        slot->setStateFromEnvelope(e);
-    }
+    auto slot = getSlot(slotIndex, true);
+    slot->setStateFromEnvelope(e);
 }
 
 bool
@@ -209,34 +225,60 @@ SCP::empty() const
     return mKnownSlots.empty();
 }
 
-uint64
-SCP::getLowSlotIndex() const
-{
-    assert(!empty());
-    return mKnownSlots.begin()->first;
-}
-
-uint64
-SCP::getHighSlotIndex() const
-{
-    assert(!empty());
-    auto it = mKnownSlots.end();
-    it--;
-    return it->first;
-}
-
-std::vector<SCPEnvelope>
-SCP::getCurrentState(uint64 slotIndex)
+void
+SCP::processCurrentState(uint64 slotIndex,
+                         std::function<bool(SCPEnvelope const&)> const& f,
+                         bool forceSelf)
 {
     auto slot = getSlot(slotIndex, false);
     if (slot)
     {
-        return slot->getCurrentState();
+        slot->processCurrentState(f, forceSelf);
     }
-    else
+}
+
+void
+SCP::processSlotsAscendingFrom(uint64 startingSlot,
+                               std::function<bool(uint64)> const& f)
+{
+    for (auto iter = mKnownSlots.lower_bound(startingSlot);
+         iter != mKnownSlots.end(); ++iter)
     {
-        return std::vector<SCPEnvelope>();
+        if (!f(iter->first))
+        {
+            break;
+        }
     }
+}
+
+void
+SCP::processSlotsDescendingFrom(uint64 startingSlot,
+                                std::function<bool(uint64)> const& f)
+{
+    auto iter = mKnownSlots.upper_bound(startingSlot);
+    while (iter != mKnownSlots.begin())
+    {
+        --iter;
+        if (!f(iter->first))
+        {
+            break;
+        }
+    }
+}
+
+SCPEnvelope const*
+SCP::getLatestMessage(NodeID const& id)
+{
+    for (auto it = mKnownSlots.rbegin(); it != mKnownSlots.rend(); it++)
+    {
+        auto slot = it->second;
+        auto res = slot->getLatestMessage(id);
+        if (res != nullptr)
+        {
+            return res;
+        }
+    }
+    return nullptr;
 }
 
 std::vector<SCPEnvelope>
@@ -251,22 +293,6 @@ SCP::getExternalizingState(uint64 slotIndex)
     {
         return std::vector<SCPEnvelope>();
     }
-}
-
-SCP::TriBool
-SCP::isNodeInQuorum(NodeID const& node)
-{
-    TriBool res = TB_MAYBE;
-    for (auto& s : mKnownSlots)
-    {
-        auto slot = s.second;
-        res = slot->isNodeInQuorum(node);
-        if (res == TB_TRUE || res == TB_FALSE)
-        {
-            break;
-        }
-    }
-    return res;
 }
 
 std::string
@@ -300,19 +326,21 @@ SCP::ballotToStr(std::unique_ptr<SCPBallot> const& ballot) const
 }
 
 std::string
-SCP::envToStr(SCPEnvelope const& envelope) const
+SCP::envToStr(SCPEnvelope const& envelope, bool fullKeys) const
 {
-    return envToStr(envelope.statement);
+    return envToStr(envelope.statement, fullKeys);
 }
 
 std::string
-SCP::envToStr(SCPStatement const& st) const
+SCP::envToStr(SCPStatement const& st, bool fullKeys) const
 {
     std::ostringstream oss;
 
     Hash const& qSetHash = Slot::getCompanionQuorumSetHashFromStatement(st);
 
-    oss << "{ENV@" << mDriver.toShortString(st.nodeID) << " | "
+    std::string nodeId = mDriver.toStrKey(st.nodeID, fullKeys);
+
+    oss << "{ENV@" << nodeId << " | "
         << " i: " << st.slotIndex;
     switch (st.pledges.type())
     {

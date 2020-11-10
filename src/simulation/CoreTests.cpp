@@ -8,12 +8,11 @@
 #include "bucket/BucketManagerImpl.h"
 #include "bucket/LedgerCmp.h"
 #include "crypto/SHA.h"
-#include "herder/Herder.h"
+#include "herder/HerderImpl.h"
 #include "herder/LedgerCloseData.h"
 #include "ledger/LedgerManager.h"
-#include "ledger/LedgerTestUtils.h"
+#include "ledger/test/LedgerTestUtils.h"
 #include "lib/catch.hpp"
-#include "lib/util/format.h"
 #include "main/Application.h"
 #include "medida/stats/snapshot.h"
 #include "overlay/StellarXDR.h"
@@ -22,18 +21,15 @@
 #include "transactions/TransactionFrame.h"
 #include "util/Logging.h"
 #include "util/Math.h"
-#include "util/format.h"
-#include "util/make_unique.h"
 #include "util/types.h"
 #include "xdrpp/autocheck.h"
+#include <fmt/format.h>
 #include <sstream>
 
 using namespace stellar;
 
-typedef std::unique_ptr<Application> appPtr;
-
 // Simulation tests. Some of the tests in this suite are long.
-// They are marked with [long][hide]. Run the day-to-day tests with
+// They are marked with [long][!hide]. Run the day-to-day tests with
 //
 //     --test
 // or
@@ -54,9 +50,7 @@ printStats(int& nLedgers, std::chrono::system_clock::time_point tBegin,
     LOG(INFO) << sim->metricsSummary("scp");
 }
 
-#include "lib/util/lrucache.hpp"
-
-TEST_CASE("3 nodes. 2 running. threshold 2", "[simulation][core3]")
+TEST_CASE("3 nodes 2 running threshold 2", "[simulation][core3][acceptance]")
 {
     Simulation::Mode mode = Simulation::OVER_LOOPBACK;
     SECTION("Over loopback")
@@ -93,8 +87,6 @@ TEST_CASE("3 nodes. 2 running. threshold 2", "[simulation][core3]")
         simulation->addPendingConnection(keys[0].getPublicKey(),
                                          keys[1].getPublicKey());
 
-        auto tBegin = std::chrono::system_clock::now();
-
         LOG(INFO) << "#######################################################";
 
         simulation->startAllNodes();
@@ -106,14 +98,44 @@ TEST_CASE("3 nodes. 2 running. threshold 2", "[simulation][core3]")
             },
             2 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
 
-        // printStats(nLedgers, tBegin, simulation);
-
         REQUIRE(simulation->haveAllExternalized(nLedgers + 1, 5));
     }
     LOG(DEBUG) << "done with core3 test";
 }
 
-TEST_CASE("core topology: 4 ledgers at scales 2..4", "[simulation]")
+TEST_CASE("assymetric topology report cost", "[simulation][!hide]")
+{
+    // Ensure we close enough ledgers to start purging slots
+    // (which is when cost gets reported)
+    const int nLedgers = 20;
+
+    Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
+    Simulation::pointer simulation =
+        Topologies::assymetric(Simulation::OVER_LOOPBACK, networkID);
+    simulation->startAllNodes();
+
+    simulation->crankUntil(
+        [&]() { return simulation->haveAllExternalized(nLedgers + 2, 4); },
+        10 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
+
+    REQUIRE(simulation->haveAllExternalized(nLedgers, 4));
+
+    auto checkNode = SecretKey::fromSeed(sha256("TIER_1_NODE_SEED_0"));
+    auto app = simulation->getNode(checkNode.getPublicKey());
+
+    auto lcl = app->getLedgerManager().getLastClosedLedgerNum();
+
+    LOG(WARNING) << "Cost information for recent ledgers:";
+    for (auto count = lcl; count > lcl - 5; count--)
+    {
+        auto qinfo = app->getHerder().getJsonQuorumInfo(
+            checkNode.getPublicKey(), false, false, count);
+        LOG(WARNING) << qinfo["qset"]["cost"].toStyledString();
+    }
+}
+
+TEST_CASE("core topology 4 ledgers at scales 2 to 4",
+          "[simulation][acceptance]")
 {
     Simulation::Mode mode = Simulation::OVER_LOOPBACK;
     SECTION("Over loopback")
@@ -129,8 +151,6 @@ TEST_CASE("core topology: 4 ledgers at scales 2..4", "[simulation]")
 
     for (int size = 2; size <= 4; size++)
     {
-        auto tBegin = std::chrono::system_clock::now();
-
         Simulation::pointer sim = Topologies::core(size, 1.0, mode, networkID);
         sim->startAllNodes();
 
@@ -142,8 +162,6 @@ TEST_CASE("core topology: 4 ledgers at scales 2..4", "[simulation]")
             2 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
 
         REQUIRE(sim->haveAllExternalized(nLedgers + 1, 5));
-
-        // printStats(nLedgers, tBegin, sim);
     }
 }
 
@@ -153,65 +171,87 @@ resilienceTest(Simulation::pointer sim)
     auto nodes = sim->getNodeIDs();
     auto nbNodes = nodes.size();
 
-    for (size_t i = 0; i < nbNodes; i++)
+    sim->startAllNodes();
+
+    std::uniform_int_distribution<size_t> gen(0, nbNodes - 1);
+
+    // bring network to a good place
+    uint32 targetLedger = LedgerManager::GENESIS_LEDGER_SEQ + 1;
+    const uint32 nbLedgerStep = 2;
+
+    auto crankForward = [&](uint32 step, uint32 maxGap) {
+        targetLedger += step;
+        sim->crankUntil(
+            [&]() { return sim->haveAllExternalized(targetLedger, maxGap); },
+            5 * nbLedgerStep * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+
+        REQUIRE(sim->haveAllExternalized(targetLedger, maxGap));
+    };
+
+    crankForward(1, 1);
+
+    for (size_t rounds = 0; rounds < 2; rounds++)
     {
-        // now restart a victim node i, will reconnect to
+        // now restart a random node i, will reconnect to
         // j to join the network
+        auto i = gen(gRandomEngine);
         auto j = (i + 1) % nbNodes;
 
         auto victimID = nodes[i];
         auto otherID = nodes[j];
-        SECTION(fmt::format("restart victim {}", i))
+        INFO(fmt::format("restart victim {}", i));
+
+        targetLedger =
+            sim->getNode(otherID)->getLedgerManager().getLastClosedLedgerNum();
+
+        auto victimConfig = sim->getNode(victimID)->getConfig();
+        // don't force SCP, it's just a restart
+        victimConfig.FORCE_SCP = false;
+        // kill instance
+        sim->removeNode(victimID);
+        // let the rest of the network move on
+        crankForward(nbLedgerStep, 1);
+        // start the instance
+        sim->addNode(victimConfig.NODE_SEED, victimConfig.QUORUM_SET,
+                     &victimConfig, false);
+        auto refreshedApp = sim->getNode(victimID);
+        refreshedApp->start();
+        // connect to another node
+        sim->addConnection(victimID, otherID);
+        // this crank should allow the node to rejoin the network
+        crankForward(1, INT32_MAX);
+
+        // check that all slots were validated
+        auto herderImpl = static_cast<HerderImpl*>(&refreshedApp->getHerder());
+        auto& scp = herderImpl->getSCP();
+        scp.processSlotsAscendingFrom(0, [&](uint64 slot) {
+            bool validated = scp.isSlotFullyValidated(slot);
+            REQUIRE(validated);
+            return true;
+        });
+
+        // network should be fully in sync now
+        crankForward(nbLedgerStep, 1);
+
+        // reconnect to all other peers for the next iteration
+        for (size_t k = 0; k < nbNodes; k++)
         {
-            // bring network to a good place
-            sim->startAllNodes();
-
-            uint32 targetLedger = 2;
-            const uint32 nbLedgerStep = 3;
-
-            auto crankForward = [&](uint32 step, uint32 maxGap) {
-                targetLedger += step;
-                sim->crankUntil(
-                    [&]() {
-                        return sim->haveAllExternalized(targetLedger, maxGap);
-                    },
-                    2 * nbLedgerStep * Herder::EXP_LEDGER_TIMESPAN_SECONDS,
-                    false);
-
-                REQUIRE(sim->haveAllExternalized(targetLedger, maxGap));
-            };
-
-            crankForward(nbLedgerStep, 1);
-
-            auto victimConfig = sim->getNode(victimID)->getConfig();
-            // kill instance
-            sim->removeNode(victimID);
-            // let the rest of the network move on
-            crankForward(nbLedgerStep, 1);
-            // start the instance
-            sim->addNode(victimConfig.NODE_SEED, victimConfig.QUORUM_SET,
-                         &victimConfig, false);
-            auto refreshedApp = sim->getNode(victimID);
-            refreshedApp->start();
-            // connect to another node
-            sim->addConnection(victimID, otherID);
-            // this crank should allow the node to rejoin the network
-            crankForward(1, INT32_MAX);
-            // network should be fully in sync now
-            crankForward(nbLedgerStep, 1);
+            if (k != i && k != j)
+            {
+                sim->addConnection(victimID, nodes[k]);
+            }
         }
     }
 }
-TEST_CASE("resilience tests", "[resilience][simulation][long][hide]")
+TEST_CASE("resilience tests", "[resilience][simulation][!hide]")
 {
     Simulation::Mode mode = Simulation::OVER_LOOPBACK;
 
     Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
 
-    int configNum = 0;
-    auto confGen = [&configNum]() -> Config {
+    auto confGen = [](int configNum) -> Config {
         // we have to have persistent nodes as we want to simulate a restart
-        auto c = getTestConfig(configNum++, Config::TESTDB_ON_DISK_SQLITE);
+        auto c = getTestConfig(configNum, Config::TESTDB_ON_DISK_SQLITE);
         return c;
     };
 
@@ -245,7 +285,6 @@ hierarchicalTopoTest(int nLedgers, int nBranches, Simulation::Mode mode,
                      Hash const& networkID)
 {
     LOG(DEBUG) << "starting topo test " << nLedgers << " : " << nBranches;
-    auto tBegin = std::chrono::system_clock::now();
 
     Simulation::pointer sim =
         Topologies::hierarchicalQuorum(nBranches, mode, networkID);
@@ -258,11 +297,9 @@ hierarchicalTopoTest(int nLedgers, int nBranches, Simulation::Mode mode,
         20 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
 
     REQUIRE(sim->haveAllExternalized(nLedgers + 1, 5));
-
-    // printStats(nLedgers, tBegin, sim);
 }
 
-TEST_CASE("hierarchical topology scales 1..3", "[simulation]")
+TEST_CASE("hierarchical topology scales 1 to 3", "[simulation][acceptance]")
 {
     Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
     Simulation::Mode mode = Simulation::OVER_LOOPBACK;
@@ -292,7 +329,6 @@ hierarchicalSimplifiedTest(int nLedgers, int nbCore, int nbOuterNodes,
                            Simulation::Mode mode, Hash const& networkID)
 {
     LOG(DEBUG) << "starting simplified test " << nLedgers << " : " << nbCore;
-    auto tBegin = std::chrono::system_clock::now();
 
     Simulation::pointer sim = Topologies::hierarchicalQuorumSimplified(
         nbCore, nbOuterNodes, mode, networkID);
@@ -305,11 +341,9 @@ hierarchicalSimplifiedTest(int nLedgers, int nbCore, int nbOuterNodes,
         20 * nLedgers * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
 
     REQUIRE(sim->haveAllExternalized(nLedgers + 1, 3));
-
-    // printStats(nLedgers, tBegin, sim);
 }
 
-TEST_CASE("core-nodes with outer nodes", "[simulation]")
+TEST_CASE("core nodes with outer nodes", "[simulation][acceptance]")
 {
     Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
     Simulation::Mode mode = Simulation::OVER_LOOPBACK;
@@ -341,8 +375,9 @@ TEST_CASE("cycle4 topology", "[simulation]")
     REQUIRE(simulation->haveAllExternalized(nLedgers, 4));
 }
 
-TEST_CASE("Stress test on 2 nodes 3 accounts 10 random transactions 10tx/sec",
-          "[stress100][simulation][stress][long][hide]")
+TEST_CASE(
+    "Stress test on 2 nodes 3 accounts 10 random transactions 10tx per sec",
+    "[stress100][simulation][stress][long][!hide]")
 {
     Hash networkID = sha256(getTestConfig().NETWORK_PASSPHRASE);
     Simulation::pointer simulation =
@@ -353,8 +388,11 @@ TEST_CASE("Stress test on 2 nodes 3 accounts 10 random transactions 10tx/sec",
         [&]() { return simulation->haveAllExternalized(3, 1); },
         2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
-    simulation->executeAll(simulation->accountCreationTransactions(3));
+    auto nodes = simulation->getNodes();
+    auto& app = *nodes[0]; // pick a node to generate load
 
+    auto& lg = app.getLoadGenerator();
+    lg.generateLoad(true, 3, 0, 0, 10, 100, std::chrono::seconds(0), 0);
     try
     {
         simulation->crankUntil(
@@ -363,22 +401,21 @@ TEST_CASE("Stress test on 2 nodes 3 accounts 10 random transactions 10tx/sec",
                 // to the second node in time and the second node gets the
                 // nomination
                 return simulation->haveAllExternalized(5, 2) &&
-                       simulation->accountsOutOfSyncWithDb().empty();
+                       lg.checkAccountSynced(app, true).empty();
             },
             3 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
 
-        auto crankingTime =
-            simulation->executeStressTest(10, 10, [&simulation](size_t i) {
-                return simulation->createRandomTransaction(0.5);
-            });
-
+        lg.generateLoad(false, 3, 0, 10, 10, 100, std::chrono::seconds(0), 0);
         simulation->crankUntil(
-            [&]() { return simulation->accountsOutOfSyncWithDb().empty(); },
-            std::chrono::seconds(60), true);
+            [&]() {
+                return simulation->haveAllExternalized(8, 2) &&
+                       lg.checkAccountSynced(app, false).empty();
+            },
+            2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
     }
     catch (...)
     {
-        auto problems = simulation->accountsOutOfSyncWithDb();
+        auto problems = lg.checkAccountSynced(app, false);
         REQUIRE(problems.empty());
     }
 
@@ -394,29 +431,13 @@ newLoadTestApp(VirtualClock& clock)
 #endif
                       getTestConfig(0, Config::TESTDB_ON_DISK_SQLITE);
     cfg.RUN_STANDALONE = false;
-    cfg.TESTING_UPGRADE_MAX_TX_PER_LEDGER = 10000;
-    Application::pointer appPtr = Application::create(clock, cfg);
-    appPtr->start();
     // force maxTxSetSize to avoid throwing txSets on the floor during the first
     // ledger close
-    appPtr->getLedgerManager().getCurrentLedgerHeader().maxTxSetSize =
-        cfg.TESTING_UPGRADE_MAX_TX_PER_LEDGER;
+    cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE = 10000;
+    cfg.USE_CONFIG_FOR_GENESIS = true;
+    Application::pointer appPtr = Application::create(clock, cfg);
+    appPtr->start();
     return appPtr;
-}
-
-TEST_CASE("Auto-calibrated single node load test", "[autoload][hide]")
-{
-    VirtualClock clock(VirtualClock::REAL_TIME);
-    auto appPtr = newLoadTestApp(clock);
-    appPtr->generateLoad(100000, 100000, 10, true);
-    auto& io = clock.getIOService();
-    asio::io_service::work mainWork(io);
-    auto& complete =
-        appPtr->getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
-    while (!io.stopped() && complete.count() == 0)
-    {
-        clock.crank();
-    }
 }
 
 class ScaleReporter
@@ -450,8 +471,9 @@ class ScaleReporter
         : mColumns(columns)
         , mFilename(fmt::format("{:s}-{:d}.csv", join(columns, "-vs-"),
                                 std::time(nullptr)))
-        , mOut(mFilename)
     {
+        mOut.exceptions(std::ios::failbit | std::ios::badbit);
+        mOut.open(mFilename);
         LOG(INFO) << "Opened " << mFilename << " for writing";
         mOut << join(columns, ",") << std::endl;
     }
@@ -482,69 +504,7 @@ class ScaleReporter
     }
 };
 
-static void
-closeLedger(Application& app)
-{
-    auto& clock = app.getClock();
-    bool advanced = false;
-    VirtualTimer t(clock);
-    auto nsecs = std::chrono::seconds(Herder::EXP_LEDGER_TIMESPAN_SECONDS);
-    if (app.getConfig().ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING)
-    {
-        nsecs = std::chrono::seconds(1);
-    }
-    t.expires_from_now(nsecs);
-    t.async_wait([&](asio::error_code ec) { advanced = true; });
-
-    auto& io = clock.getIOService();
-    asio::io_service::work mainWork(io);
-    auto& lm = app.getLedgerManager();
-    auto start = lm.getLastClosedLedgerNum();
-    while ((!io.stopped() && lm.getLastClosedLedgerNum() == start) || !advanced)
-    {
-        clock.crank();
-    }
-}
-
-static void
-generateAccountsAndCloseLedger(Application& app, int num)
-{
-    auto& lg = app.getLoadGenerator();
-    std::vector<LoadGenerator::TxInfo> txs;
-    uint32_t ledgerNum = app.getLedgerManager().getLedgerNum();
-    int tries = num * 100;
-    while (tries-- > 0 && txs.size() < (size_t)num)
-    {
-        lg.maybeCreateAccount(ledgerNum, txs);
-    }
-    LOG(INFO) << "Creating " << num << " accounts via txs...";
-    for (auto& tx : txs)
-    {
-        tx.execute(app);
-    }
-    closeLedger(app);
-}
-
-static void
-generateTxsAndCloseLedger(Application& app, int num)
-{
-    auto& lg = app.getLoadGenerator();
-    std::vector<LoadGenerator::TxInfo> txs;
-    uint32_t ledgerNum = app.getLedgerManager().getLedgerNum();
-    int tries = num * 100;
-    while (tries-- > 0 && txs.size() < (size_t)num)
-    {
-        txs.push_back(lg.createRandomTransaction(0.5, ledgerNum));
-    }
-    LOG(INFO) << "Applying " << txs.size() << " transactions...";
-    for (auto& tx : txs)
-    {
-        tx.execute(app);
-    }
-    closeLedger(app);
-}
-
-TEST_CASE("Accounts vs. latency", "[scalability][hide]")
+TEST_CASE("Accounts vs latency", "[scalability][!hide]")
 {
     ScaleReporter r({"accounts", "txcount", "latencymin", "latencymax",
                      "latency50", "latency95", "latency99"});
@@ -554,75 +514,71 @@ TEST_CASE("Accounts vs. latency", "[scalability][hide]")
     auto& app = *appPtr;
 
     auto& lg = app.getLoadGenerator();
-    auto& txtime = app.getMetrics().NewTimer({"transaction", "op", "apply"});
+    auto& txtime = app.getMetrics().NewTimer({"ledger", "operation", "apply"});
+    uint32_t numItems = 500000;
 
-    int step = 5000;
-    size_t total = 10000000;
+    // Create accounts
+    lg.generateLoad(true, numItems, 0, 0, 10, 100, std::chrono::seconds(0), 0);
 
-    closeLedger(app);
-    closeLedger(app);
+    auto& complete =
+        appPtr->getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
 
-    while (!app.getClock().getIOService().stopped() &&
-           lg.mAccounts.size() < total)
+    auto& io = clock.getIOContext();
+    asio::io_context::work mainWork(io);
+    while (!io.stopped() && complete.count() == 0)
     {
-        LOG(INFO) << "Creating " << (step * 10) << " bulking accounts and "
-                  << (step / 10) << " interesting accounts ("
-                  << 100 * (((double)lg.mAccounts.size()) / ((double)total))
-                  << "%)";
-
-        auto curr = lg.mAccounts.size();
-
-        // First, create 10*step "bulking" accounts
-        auto accounts = lg.createAccounts(step * 10);
-        for (auto& acc : accounts)
-        {
-            acc->createDirectly(app);
-        }
-
-        // Then create step/10 "interesting" accounts via txs that set up
-        // trustlines and offers and such
-        generateAccountsAndCloseLedger(app, step / 10);
-
-        // Reload everything we just added.
-        while (curr < lg.mAccounts.size())
-        {
-            lg.loadAccount(app, lg.mAccounts.at(curr++));
-        }
-
-        txtime.Clear();
-
-        // Then generate some non-account-creating (payment) txs in
-        // a subsequent ledger.
-        generateTxsAndCloseLedger(app, step / 10);
-
-        app.reportCfgMetrics();
-        r.write({(double)lg.mAccounts.size(), (double)txtime.count(),
-                 txtime.min(), txtime.max(), txtime.GetSnapshot().getMedian(),
-                 txtime.GetSnapshot().get95thPercentile(),
-                 txtime.GetSnapshot().get99thPercentile()});
+        clock.crank();
     }
+
+    txtime.Clear();
+
+    // Generate payment txs
+    lg.generateLoad(false, numItems, 0, numItems / 10, 10, 100,
+                    std::chrono::seconds(0), 0);
+    while (!io.stopped() && complete.count() == 1)
+    {
+        clock.crank();
+    }
+
+    // Report latency
+    app.reportCfgMetrics();
+    r.write({(double)numItems, (double)txtime.count(), txtime.min(),
+             txtime.max(), txtime.GetSnapshot().getMedian(),
+             txtime.GetSnapshot().get95thPercentile(),
+             txtime.GetSnapshot().get99thPercentile()});
 }
 
 static void
-netTopologyTest(
-    std::string const& name,
-    std::function<Simulation::pointer(int numNodes, int& cfgCount)> mkSim)
+netTopologyTest(std::string const& name,
+                std::function<Simulation::pointer(int numNodes)> mkSim)
 {
     ScaleReporter r(
         {name + "nodes", "in-msg", "in-byte", "out-msg", "out-byte"});
 
     for (int numNodes = 4; numNodes < 64; numNodes += 4)
     {
-        auto cfgCount = 0;
-        auto sim = mkSim(numNodes, cfgCount);
+        auto sim = mkSim(numNodes);
         sim->startAllNodes();
+        sim->crankUntil([&]() { return sim->haveAllExternalized(5, 4); },
+                        2 * 5 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, false);
+        REQUIRE(sim->haveAllExternalized(5, 4));
+
         auto nodes = sim->getNodes();
         assert(!nodes.empty());
         auto& app = *nodes[0];
-        closeLedger(app);
 
-        generateAccountsAndCloseLedger(app, 50);
-        closeLedger(app);
+        auto& lg = app.getLoadGenerator();
+        lg.generateLoad(true, 50, 0, 0, 10, 100, std::chrono::seconds(0), 0);
+        auto& complete =
+            app.getMetrics().NewMeter({"loadgen", "run", "complete"}, "run");
+
+        sim->crankUntil(
+            [&]() {
+                return sim->haveAllExternalized(8, 2) &&
+                       lg.checkAccountSynced(app, true).empty() &&
+                       complete.count() == 1;
+            },
+            2 * Herder::EXP_LEDGER_TIMESPAN_SECONDS, true);
 
         app.reportCfgMetrics();
 
@@ -646,53 +602,55 @@ netTopologyTest(
     }
 }
 
-TEST_CASE("Mesh nodes vs. network traffic", "[scalability][hide]")
+TEST_CASE("Mesh nodes vs network traffic", "[scalability][!hide]")
 {
-    netTopologyTest(
-        "mesh", [&](int numNodes, int& cfgCount) -> Simulation::pointer {
-            return Topologies::core(
-                numNodes, 1.0, Simulation::OVER_LOOPBACK,
-                sha256(fmt::format("nodes-{:d}", numNodes)), [&]() -> Config {
-                    Config res = getTestConfig(cfgCount++);
-                    res.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
-                    res.MAX_PEER_CONNECTIONS = 1000;
-                    return res;
-                });
-        });
+    netTopologyTest("mesh", [&](int numNodes) -> Simulation::pointer {
+        return Topologies::core(
+            numNodes, 1.0, Simulation::OVER_LOOPBACK,
+            sha256(fmt::format("nodes-{:d}", numNodes)),
+            [&](int cfgNum) -> Config {
+                Config res = getTestConfig(cfgNum);
+                res.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+                res.TARGET_PEER_CONNECTIONS = 1000;
+                res.MAX_ADDITIONAL_PEER_CONNECTIONS = 1000;
+                return res;
+            });
+    });
 }
 
-TEST_CASE("Cycle nodes vs. network traffic", "[scalability][hide]")
+TEST_CASE("Cycle nodes vs network traffic", "[scalability][!hide]")
 {
-    netTopologyTest(
-        "cycle", [&](int numNodes, int& cfgCount) -> Simulation::pointer {
-            return Topologies::cycle(
-                numNodes, 1.0, Simulation::OVER_LOOPBACK,
-                sha256(fmt::format("nodes-{:d}", numNodes)), [&]() -> Config {
-                    Config res = getTestConfig(cfgCount++);
-                    res.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
-                    res.MAX_PEER_CONNECTIONS = 1000;
-                    return res;
-                });
-        });
+    netTopologyTest("cycle", [&](int numNodes) -> Simulation::pointer {
+        return Topologies::cycle(
+            numNodes, 1.0, Simulation::OVER_LOOPBACK,
+            sha256(fmt::format("nodes-{:d}", numNodes)),
+            [](int cfgCount) -> Config {
+                Config res = getTestConfig(cfgCount);
+                res.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+                res.TARGET_PEER_CONNECTIONS = 1000;
+                res.MAX_ADDITIONAL_PEER_CONNECTIONS = 1000;
+                return res;
+            });
+    });
 }
 
-TEST_CASE("Branched-cycle nodes vs. network traffic", "[scalability][hide]")
+TEST_CASE("Branched cycle nodes vs network traffic", "[scalability][!hide]")
 {
-    netTopologyTest(
-        "branchedcycle",
-        [&](int numNodes, int& cfgCount) -> Simulation::pointer {
-            return Topologies::branchedcycle(
-                numNodes, 1.0, Simulation::OVER_LOOPBACK,
-                sha256(fmt::format("nodes-{:d}", numNodes)), [&]() -> Config {
-                    Config res = getTestConfig(cfgCount++);
-                    res.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
-                    res.MAX_PEER_CONNECTIONS = 1000;
-                    return res;
-                });
-        });
+    netTopologyTest("branchedcycle", [&](int numNodes) -> Simulation::pointer {
+        return Topologies::branchedcycle(
+            numNodes, 1.0, Simulation::OVER_LOOPBACK,
+            sha256(fmt::format("nodes-{:d}", numNodes)),
+            [](int cfgCount) -> Config {
+                Config res = getTestConfig(cfgCount);
+                res.ARTIFICIALLY_ACCELERATE_TIME_FOR_TESTING = true;
+                res.TARGET_PEER_CONNECTIONS = 1000;
+                res.MAX_ADDITIONAL_PEER_CONNECTIONS = 1000;
+                return res;
+            });
+    });
 }
 
-TEST_CASE("Bucket-list entries vs. write throughput", "[scalability][hide]")
+TEST_CASE("Bucket list entries vs write throughput", "[scalability][!hide]")
 {
     VirtualClock clock;
     Config const& cfg = getTestConfig();
@@ -712,12 +670,13 @@ TEST_CASE("Bucket-list entries vs. write throughput", "[scalability][hide]")
                      "mergelatencymax", "mergelatencymean"});
 
     for (uint32_t i = 1;
-         !app->getClock().getIOService().stopped() && i < 0x200000; ++i)
+         !app->getClock().getIOContext().stopped() && i < 0x200000; ++i)
     {
         app->getClock().crank(false);
         app->getBucketManager().addBatch(
-            *app, i, LedgerTestUtils::generateValidLedgerEntries(100),
-            deadGen(5));
+            *app, i, Config::CURRENT_LEDGER_PROTOCOL_VERSION,
+            LedgerTestUtils::generateValidLedgerEntries(100),
+            LedgerTestUtils::generateValidLedgerEntries(20), deadGen(5));
 
         if ((i & 0xff) == 0xff)
         {

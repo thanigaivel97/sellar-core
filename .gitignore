@@ -20,9 +20,18 @@
 *.trs
 *.db
 
+# sourcetrail
+compile_commands.json
+*.srctrlbm
+*.srctrldb
+*.srctrlprj
+
 # text editors
 *~
 *.swp
+**/.vscode/*
+.idea
+.clangd
 
 .libs
 .deps
@@ -30,7 +39,8 @@
 
 /INSTALL
 
-/src/StellarCoreVersion.h
+/src/main/StellarCoreVersion.cpp
+/src/testdata
 /src/xdr/*.h
 /Makefile
 /Makefile.in
@@ -64,9 +74,12 @@
 /src/src.mk
 /lib/medida.mk
 /lib/lib.mk
+/scripts/*.graphml
+/scripts/*.json
 
 # test output
-/stellar-core-test-*
+stellar-core-test-*
+test-partitions.*
 /fuzz-findings/
 /my-history/
 

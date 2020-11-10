@@ -9,6 +9,8 @@
 namespace stellar
 {
 
+class AbstractLedgerTxn;
+
 class CreateAccountOpFrame : public OperationFrame
 {
     CreateAccountResult&
@@ -18,13 +20,21 @@ class CreateAccountOpFrame : public OperationFrame
     }
     CreateAccountOp const& mCreateAccount;
 
+    bool doApplyBeforeV14(AbstractLedgerTxn& ltx);
+    bool doApplyFromV14(AbstractLedgerTxn& ltxOuter);
+
+    bool checkLowReserve(AbstractLedgerTxn& ltx);
+    bool deductStartingBalance(AbstractLedgerTxn& ltx);
+    void createAccount(AbstractLedgerTxn& ltx);
+
   public:
     CreateAccountOpFrame(Operation const& op, OperationResult& res,
                          TransactionFrame& parentTx);
 
-    bool doApply(Application& app, LedgerDelta& delta,
-                 LedgerManager& ledgerManager) override;
-    bool doCheckValid(Application& app) override;
+    bool doApply(AbstractLedgerTxn& ltx) override;
+    bool doCheckValid(uint32_t ledgerVersion) override;
+    void insertLedgerKeysToPrefetch(
+        std::unordered_set<LedgerKey>& keys) const override;
 
     static CreateAccountResultCode
     getInnerCode(OperationResult const& res)

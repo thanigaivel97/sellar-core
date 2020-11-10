@@ -5,7 +5,6 @@
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
 #include "crypto/SecretKey.h"
-#include "ledger/OfferFrame.h"
 #include "transactions/TransactionFrame.h"
 #include "xdr/Stellar-ledger-entries.h"
 #include "xdr/Stellar-transaction.h"
@@ -17,7 +16,7 @@ class Application;
 
 namespace txtest
 {
-struct ThresholdSetter;
+struct SetOptionsArguments;
 }
 
 class TestAccount
@@ -42,36 +41,56 @@ class TestAccount
 
     Asset asset(std::string const& name);
     void changeTrust(Asset const& asset, int64_t limit);
+    void allowTrust(Asset const& asset, PublicKey const& trustor,
+                    uint32_t flag);
     void allowTrust(Asset const& asset, PublicKey const& trustor);
     void denyTrust(Asset const& asset, PublicKey const& trustor);
+    void allowMaintainLiabilities(Asset const& asset, PublicKey const& trustor);
 
     TrustLineEntry loadTrustLine(Asset const& asset) const;
     bool hasTrustLine(Asset const& asset) const;
 
-    void setOptions(AccountID* inflationDest, uint32_t* setFlags,
-                    uint32_t* clearFlags, txtest::ThresholdSetter* thrs,
-                    Signer* signer, std::string* homeDomain);
+    void setOptions(txtest::SetOptionsArguments const& arguments);
 
     void manageData(std::string const& name, DataValue* value);
 
-    OfferEntry loadOffer(uint64_t offerID) const;
-    bool hasOffer(uint64_t offerID) const;
+    void bumpSequence(SequenceNumber to);
 
-    uint64_t
-    manageOffer(uint64_t offerID, Asset const& selling, Asset const& buying,
+    ClaimableBalanceID
+    createClaimableBalance(Asset const& asset, int64_t amount,
+                           xdr::xvector<Claimant, 10> const& claimants);
+
+    void claimClaimableBalance(ClaimableBalanceID const& balanceID);
+
+    ClaimableBalanceID getBalanceID(uint32_t opIndex, SequenceNumber sn = 0);
+
+    int64_t
+    manageOffer(int64_t offerID, Asset const& selling, Asset const& buying,
                 Price const& price, int64_t amount,
                 ManageOfferEffect expectedEffect = MANAGE_OFFER_CREATED);
 
-    uint64_t
+    int64_t
+    manageBuyOffer(int64_t offerID, Asset const& selling, Asset const& buying,
+                   Price const& price, int64_t amount,
+                   ManageOfferEffect expectedEffect = MANAGE_OFFER_CREATED);
+
+    int64_t
     createPassiveOffer(Asset const& selling, Asset const& buying,
                        Price const& price, int64_t amount,
                        ManageOfferEffect expectedEffect = MANAGE_OFFER_CREATED);
 
     void pay(PublicKey const& destination, int64_t amount);
     void pay(PublicKey const& destination, Asset const& asset, int64_t amount);
-    PathPaymentResult pay(PublicKey const& destination, Asset const& sendCur,
-                          int64_t sendMax, Asset const& destCur,
-                          int64_t destAmount, std::vector<Asset> const& path,
+    PathPaymentStrictReceiveResult pay(PublicKey const& destination,
+                                       Asset const& sendCur, int64_t sendMax,
+                                       Asset const& destCur, int64_t destAmount,
+                                       std::vector<Asset> const& path,
+                                       Asset* noIssuer = nullptr);
+
+    PathPaymentStrictSendResult
+    pathPaymentStrictSend(PublicKey const& destination, Asset const& sendCur,
+                          int64_t sendAmount, Asset const& destCur,
+                          int64_t destMin, std::vector<Asset> const& path,
                           Asset* noIssuer = nullptr);
 
     operator SecretKey() const
@@ -83,12 +102,12 @@ class TestAccount
         return getPublicKey();
     }
 
-    const SecretKey&
+    SecretKey const&
     getSecretKey() const
     {
         return mSk;
     }
-    PublicKey
+    PublicKey const&
     getPublicKey() const
     {
         return mSk.getPublicKey();
@@ -113,9 +132,18 @@ class TestAccount
         updateSequenceNumber();
         return ++mSn;
     }
-    SequenceNumber loadSequenceNumber() const;
+    SequenceNumber loadSequenceNumber();
+
+    std::string
+    getAccountId()
+    {
+        return mAccountID;
+    }
 
     int64_t getBalance() const;
+    int64_t getAvailableBalance() const;
+
+    bool exists() const;
 
   private:
     Application& mApp;
