@@ -132,6 +132,9 @@ Config::Config() : NODE_SEED(SecretKey::random())
 
     TESTING_UPGRADE_DESIRED_FEE = LedgerManager::GENESIS_LEDGER_BASE_FEE;
     TESTING_UPGRADE_RESERVE = LedgerManager::GENESIS_LEDGER_BASE_RESERVE;
+    TESTING_UPGRADE_DESIRED_PERCENTAGE_FEE =
+        LedgerManager::GENESIS_LEDGER_PERCENTAGE_FEE;
+    TESTING_UPGRADE_DESIRED_MAX_FEE = LedgerManager::GENESIS_LEDGER_MAX_FEE;
     TESTING_UPGRADE_MAX_TX_SET_SIZE = 50;
 
     HTTP_PORT = DEFAULT_PEER_PORT + 1;
@@ -146,6 +149,16 @@ Config::Config() : NODE_SEED(SecretKey::random())
     PEER_AUTHENTICATION_TIMEOUT = 2;
     PEER_TIMEOUT = 30;
     PEER_STRAGGLER_TIMEOUT = 120;
+
+    // time spent picking up items from a connection all at once, this should be
+    // picked high enough that we can pick up as many items as possible but low
+    // enough that we give a chance to cycle through all connections in a
+    // reasonable amount of time. 10ms would allow to cycle through 100
+    // connections in one second
+    MAX_BATCH_READ_PERIOD_MS = std::chrono::milliseconds(10);
+    // during transaction spikes, we want to increase the chance of picking up
+    // items behind transactions
+    MAX_BATCH_READ_COUNT = 1000;
 
     MAX_BATCH_WRITE_COUNT = 1024;
     MAX_BATCH_WRITE_BYTES = 1 * 1024 * 1024;
@@ -829,6 +842,15 @@ Config::processConfig(std::shared_ptr<cpptoml::table> t)
             {
                 PEER_STRAGGLER_TIMEOUT = readInt<unsigned short>(
                     item, 1, std::numeric_limits<unsigned short>::max());
+            }
+            else if (item.first == "MAX_BATCH_READ_PERIOD_MS")
+            {
+                MAX_BATCH_READ_PERIOD_MS =
+                    std::chrono::milliseconds(readInt<int>(item, 1));
+            }
+            else if (item.first == "MAX_BATCH_READ_COUNT")
+            {
+                MAX_BATCH_READ_COUNT = readInt<int>(item, 1);
             }
             else if (item.first == "MAX_BATCH_WRITE_COUNT")
             {

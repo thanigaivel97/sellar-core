@@ -291,8 +291,12 @@ class Config : public std::enable_shared_from_this<Config>
     std::string VERSION_STR;
     std::string LOG_FILE_PATH;
     std::string BUCKET_DIR_PATH;
-    uint32_t TESTING_UPGRADE_DESIRED_FEE; // in stroops
-    uint32_t TESTING_UPGRADE_RESERVE;     // in stroops
+    uint32_t TESTING_UPGRADE_DESIRED_FEE;            // in stroops
+    uint32_t TESTING_UPGRADE_RESERVE;                // in stroops
+    uint32_t TESTING_UPGRADE_DESIRED_PERCENTAGE_FEE; // in basis points
+    int64_t TESTING_UPGRADE_DESIRED_MAX_FEE;         // in stroops
+    // uint32_t TESTING_UPGRADE_DESIRED_FEE; // in stroops
+    // uint32_t TESTING_UPGRADE_RESERVE;     // in stroops
     uint32_t TESTING_UPGRADE_MAX_TX_SET_SIZE;
     unsigned short HTTP_PORT; // what port to listen for commands
     bool PUBLIC_HTTP_PORT;    // if you accept commands from not localhost
@@ -309,6 +313,8 @@ class Config : public std::enable_shared_from_this<Config>
     unsigned short PEER_AUTHENTICATION_TIMEOUT;
     unsigned short PEER_TIMEOUT;
     unsigned short PEER_STRAGGLER_TIMEOUT;
+    std::chrono::milliseconds MAX_BATCH_READ_PERIOD_MS;
+    int MAX_BATCH_READ_COUNT;
     int MAX_BATCH_WRITE_COUNT;
     int MAX_BATCH_WRITE_BYTES;
     static constexpr auto const POSSIBLY_PREFERRED_EXTRA = 2;

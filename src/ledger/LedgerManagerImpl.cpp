@@ -43,6 +43,7 @@
 #include "xdrpp/printer.h"
 #include "xdrpp/types.h"
 #include <Tracy.hpp>
+#include <string.h>
 
 #include <chrono>
 #include <numeric>
@@ -73,9 +74,12 @@ namespace stellar
 
 const uint32_t LedgerManager::GENESIS_LEDGER_SEQ = 1;
 const uint32_t LedgerManager::GENESIS_LEDGER_VERSION = 0;
-const uint32_t LedgerManager::GENESIS_LEDGER_BASE_FEE = 100;
+const uint32_t LedgerManager::GENESIS_LEDGER_BASE_FEE = 1;
 const uint32_t LedgerManager::GENESIS_LEDGER_BASE_RESERVE = 100000000;
+const uint32_t LedgerManager::GENESIS_LEDGER_PERCENTAGE_FEE = 45;
+const uint64_t LedgerManager::GENESIS_LEDGER_MAX_FEE = 250000000000;
 const uint32_t LedgerManager::GENESIS_LEDGER_MAX_TX_SIZE = 100;
+const std::string LedgerManager::EXCEMPT_FEES[30] = ['GDJ6U5RCXSJQVBP6OGLTZOM64GV4G34VGMZ4OLKQYAKQXYM6OV5BH56P' , 'GAPS3KZ4YVEL4UYFAGTE6L6H6GRZ3KYBWGY2UTGTAJBXGUJLBCYQIXXA' , 'HGHSGHGSHGDHGHSGHD'];
 const int64_t LedgerManager::GENESIS_LEDGER_TOTAL_COINS = 1000000000000000000;
 
 std::unique_ptr<LedgerManager>
@@ -200,6 +204,9 @@ LedgerManager::genesisLedger()
     result.maxTxSetSize = GENESIS_LEDGER_MAX_TX_SIZE;
     result.totalCoins = GENESIS_LEDGER_TOTAL_COINS;
     result.ledgerSeq = GENESIS_LEDGER_SEQ;
+     result.basePercentageFee = GENESIS_LEDGER_PERCENTAGE_FEE;
+     result.excemptFees = EXCEMPT_FEES;
+    result.maxFee = GENESIS_LEDGER_MAX_FEE;
     return result;
 }
 
@@ -238,7 +245,11 @@ LedgerManagerImpl::startNewLedger()
         ledger.ledgerVersion = cfg.LEDGER_PROTOCOL_VERSION;
         ledger.baseFee = cfg.TESTING_UPGRADE_DESIRED_FEE;
         ledger.baseReserve = cfg.TESTING_UPGRADE_RESERVE;
+        ledger.basePercentageFee = cfg.TESTING_UPGRADE_DESIRED_PERCENTAGE_FEE;
+        ledger.maxFee = cfg.TESTING_UPGRADE_DESIRED_MAX_FEE;
         ledger.maxTxSetSize = cfg.TESTING_UPGRADE_MAX_TX_SET_SIZE;
+        ledger.excemptFees = cfg.EXCEMPT_FEES;
+
     }
 
     startNewLedger(ledger);
@@ -355,7 +366,8 @@ LedgerManagerImpl::getDatabase()
 uint32_t
 LedgerManagerImpl::getLastMaxTxSetSize() const
 {
-    return mLastClosedLedger.header.maxTxSetSize;
+    // return mLastClosedLedger.header.maxTxSetSize;
+    return mLastClosedLedger.header.baseFee;
 }
 
 uint32_t
@@ -366,6 +378,13 @@ LedgerManagerImpl::getLastMaxTxSetSizeOps() const
                                                         : (n * MAX_OPS_PER_TX);
 }
 
+std::string
+LedgerManagerImpl::getExcemptFee() const
+{
+    return mCurrentLedger->mHeader.excemptFees;
+}
+
+
 int64_t
 LedgerManagerImpl::getLastMinBalance(uint32_t ownerCount) const
 {
@@ -375,6 +394,31 @@ LedgerManagerImpl::getLastMinBalance(uint32_t ownerCount) const
     else
         return (2LL + ownerCount) * int64_t(lh.baseReserve);
 }
+
+// uint32_t
+// LedgerManagerImpl::getTxPercentageFee() const
+// {
+//     return mCurrentLedger->mHeader.basePercentageFee;
+// }
+
+// uint64_t
+// LedgerManagerImpl::getMaxTxFee() const
+// {
+//     return mCurrentLedger->mHeader.maxFee;
+// }
+
+uint32_t
+LedgerManagerImpl::getTxPercentageFee() const
+{
+    return mLastClosedLedger.header.basePercentageFee;
+}
+
+uint64_t
+LedgerManagerImpl::getMaxTxFee() const
+{
+    return mLastClosedLedger.header.maxFee;
+}
+
 
 uint32_t
 LedgerManagerImpl::getLastReserve() const

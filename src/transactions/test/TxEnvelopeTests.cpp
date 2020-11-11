@@ -1501,6 +1501,24 @@ TEST_CASE("txenvelope", "[tx][envelope]")
             REQUIRE(app->getLedgerManager().getLastClosedLedgerNum() == 2);
         };
 
+        SECTION("Fee over max")
+            {
+                for_all_versions(*app, [&] {
+                    txFrame =
+                        root.tx({payment(a1.getPublicKey(), paymentAmount)});
+                    txFrame->getEnvelope().tx.fee = static_cast<uint64_t>(
+                        app->getLedgerManager().getMaxTxFee() + 1);
+
+ 
+
+                    applyCheck(txFrame, *app);
+
+ 
+
+                    REQUIRE(txFrame->getResultCode() == txFEE_OVER_MAX);
+                });
+            }
+
         {
             SECTION("Insufficient fee")
             {
@@ -1518,6 +1536,8 @@ TEST_CASE("txenvelope", "[tx][envelope]")
                             app->getLedgerManager().getLastTxFee() - 1);
                 });
             }
+
+            
 
             SECTION("duplicate payment")
             {

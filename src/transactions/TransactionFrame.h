@@ -4,7 +4,7 @@
 // under the Apache License, Version 2.0. See the COPYING file at the root
 // of this distribution or at http://www.apache.org/licenses/LICENSE-2.0
 
-#include "ledger/InternalLedgerEntry.h"
+#include "ledger/GeneralizedLedgerEntry.h"
 #include "overlay/StellarXDR.h"
 #include "transactions/TransactionFrameBase.h"
 #include "util/types.h"
@@ -44,7 +44,7 @@ class TransactionFrame : public TransactionFrameBase
     TransactionEnvelope mEnvelope;
     TransactionResult mResult;
 
-    std::shared_ptr<InternalLedgerEntry const> mCachedAccount;
+    std::shared_ptr<GeneralizedLedgerEntry const> mCachedAccount;
 
     Hash const& mNetworkID;     // used to change the way we compute signatures
     mutable Hash mContentsHash; // the hash of the contents
@@ -161,6 +161,8 @@ class TransactionFrame : public TransactionFrameBase
     int64_t getFeeBid() const override;
 
     int64_t getMinFee(LedgerHeader const& header) const override;
+
+    double getFeeRatio(LedgerHeader const& header) const;
 
     virtual int64_t getFee(LedgerHeader const& header, int64_t baseFee,
                            bool applying) const override;
